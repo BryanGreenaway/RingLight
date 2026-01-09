@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=RingLight
+Comment=Screen ring light for webcam illumination
+Exec=ringlight-gui
+Icon=preferences-desktop-display
+Terminal=false
+Type=Application
+Categories=Settings;Utility;
+Keywords=webcam;light;brightness;howdy;

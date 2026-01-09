@@ -1,5 +1,4 @@
 # RingLight - Screen ring light for KDE Plasma 6
-# Convenience Makefile wrapper for CMake
 
 BUILD_DIR = build
 PREFIX ?= /usr/local
@@ -11,8 +10,8 @@ all:
 	@cd $(BUILD_DIR) && cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=$(PREFIX) ..
 	@cmake --build $(BUILD_DIR) -j$$(nproc)
 	@echo ""
-	@echo "Built successfully. Binary sizes:"
-	@ls -lh $(BUILD_DIR)/ringlight $(BUILD_DIR)/ringlight-monitor
+	@echo "Build complete:"
+	@ls -lh $(BUILD_DIR)/ringlight-overlay $(BUILD_DIR)/ringlight-gui $(BUILD_DIR)/ringlight-monitor
 
 clean:
 	rm -rf $(BUILD_DIR)
@@ -20,9 +19,17 @@ clean:
 install: all
 	@cmake --install $(BUILD_DIR)
 	@echo ""
-	@echo "Installed. Enable auto-start with:"
-	@echo "  systemctl --user enable --now ringlight-monitor"
+	@echo "Installed to $(PREFIX)"
+	@echo ""
+	@echo "To start the GUI:"
+	@echo "  ringlight-gui"
+	@echo ""
+	@echo "Or enable auto-start at login:"
+	@echo "  systemctl --user enable ringlight-monitor"
 
 uninstall:
-	rm -f $(PREFIX)/bin/ringlight $(PREFIX)/bin/ringlight-monitor
+	rm -f $(PREFIX)/bin/ringlight-overlay
+	rm -f $(PREFIX)/bin/ringlight-gui
+	rm -f $(PREFIX)/bin/ringlight-monitor
 	rm -f $(PREFIX)/lib/systemd/user/ringlight-monitor.service
+	rm -f $(PREFIX)/share/applications/ringlight.desktop

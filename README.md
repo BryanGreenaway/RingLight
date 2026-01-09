@@ -1,134 +1,241 @@
 # RingLight 🔆
 
-Lightweight screen ring light for **KDE Plasma 6** on Wayland. Illuminates your face during video calls by creating white border overlays around your screen(s).
+A lightweight screen ring light for **KDE Plasma 6** on Wayland. Illuminates your face during video calls by creating white border overlays around your screen(s).
+
+Perfect for **Howdy** (facial recognition) integration - automatically lights up when authentication is triggered, even in a dark room.
+
+![RingLight GUI](screenshots/gui.png)
 
 ## Features
 
-- **Plasma 6 native**: Uses `layer-shell-qt` for proper Wayland overlay support
-- **Lightweight**: Small Qt6 binary, Qt libs already loaded by Plasma
-- **Auto-activation**: Detects webcam/Howdy usage automatically
-- **Click-through**: Overlays don't interfere with mouse input
-- **Multi-monitor**: Works on all screens or specific ones
+- **Native Plasma 6**: Uses Qt6 and layer-shell-qt for proper Wayland support
+- **GUI Settings Panel**: Easy configuration with system tray integration
+- **Multi-Monitor**: Select which screens to illuminate
+- **Howdy Integration**: Automatically triggers when Howdy scans your face
+- **Webcam Detection**: Turns on when any app uses your camera
+- **Customizable**: Adjust color, brightness, and border width
+- **Click-to-Dismiss**: Click the ring to turn it off
+- **Lightweight**: Small binaries, minimal dependencies
+
+## Components
+
+| Binary | Description |
+|--------|-------------|
+| `ringlight-gui` | Settings panel with system tray |
+| `ringlight-overlay` | The actual screen overlay |
+| `ringlight-monitor` | Daemon that watches for webcam/Howdy |
 
 ## Requirements
 
 - KDE Plasma 6 on Wayland
-- `layer-shell-qt` (included with Plasma 6)
-- `qt6-base`
-- `cmake`
+- Qt6 (`qt6-base`)
+- layer-shell-qt (included with Plasma 6)
+- CMake (build only)
 
-## Build & Install
+## Installation
+
+### Build from Source
 
 ```bash
-# Install build dependencies (CachyOS/Arch)
+# Install dependencies (CachyOS/Arch)
 sudo pacman -S cmake qt6-base layer-shell-qt
 
 # Build
 make
 
-# Install
+# Install system-wide
 sudo make install
+```
 
-# Enable auto-start for Howdy
-systemctl --user enable --now ringlight-monitor
+### Arch/CachyOS Package
+
+```bash
+makepkg -si
 ```
 
 ## Usage
 
-### Manual
+### GUI (Recommended)
+
+Launch the settings panel:
 
 ```bash
-ringlight                    # All screens (default)
-ringlight -s 0               # Screen 0 only
-ringlight -s 1               # Screen 1 only
-ringlight -s all             # All screens (explicit)
-ringlight -w 100             # 100px border width
-ringlight -b 70              # 70% brightness
-ringlight -c FF9900          # Orange color
-ringlight -l                 # List screens with their numbers
+ringlight-gui
 ```
 
-### Automatic (Howdy Integration)
+Or find "RingLight" in your application menu.
 
-The monitor daemon watches for `howdy` process and webcam usage:
+**Features:**
+- Check/uncheck screens to enable
+- Pick any color
+- Adjust brightness and border width
+- Enable auto-activation for Howdy/webcam
+- Minimizes to system tray
+
+### Command Line
+
+**Manual overlay:**
+```bash
+ringlight-overlay                    # Primary screen
+ringlight-overlay -s DP-1            # Specific screen
+ringlight-overlay -c FF9900 -b 80    # Orange at 80% brightness
+ringlight-overlay -w 100             # 100px border width
+ringlight-overlay -l                 # List screens
+```
+
+Click on the ring to quit.
+
+**Auto-enable daemon:**
+```bash
+ringlight-monitor -v                 # Watch for Howdy/webcam
+ringlight-monitor -p howdy -p zoom   # Watch multiple processes
+ringlight-monitor -s DP-1,HDMI-A-1   # Multiple screens
+```
+
+### Systemd Service
+
+Enable automatic start at login:
 
 ```bash
-# Run directly with logging
-ringlight-monitor -v
-
-# Or via systemd (recommended)
+systemctl --user enable ringlight-monitor
 systemctl --user start ringlight-monitor
-journalctl --user -u ringlight-monitor -f
 ```
 
-**Monitor options:**
-- `-d /dev/video0` - Video device to monitor
-- `-p howdy` - Process to watch (repeatable)
-- `-a "-s 0 -w 100"` - Args to pass to ringlight (e.g., specific screen)
-- `-i 150` - Poll interval in ms (default: 150)
-
-**Example: Ring light only on your webcam monitor:**
+Customize the service:
 ```bash
-# Find which screen has your webcam
-ringlight -l
-
-# Configure monitor to use only that screen
-ringlight-monitor -v -a "-s 1"
+systemctl --user edit ringlight-monitor
 ```
 
-## How It Works
+Add your settings:
+```ini
+[Service]
+ExecStart=
+ExecStart=/usr/local/bin/ringlight-monitor -v -s DP-1 -a "-c FFFFFF -b 80 -w 100"
+```
 
-1. `ringlight-monitor` polls every 150ms checking:
-   - Is `howdy` process running?
-   - Is the video device open?
-   - Is V4L2 streaming?
+## Howdy Integration
 
-2. When activity detected → spawns `ringlight`
-3. When activity stops → kills `ringlight`
+RingLight automatically detects when Howdy runs and illuminates your face for the IR camera scan.
 
-The ring light appears before Howdy scans, illuminating your face for IR recognition.
+1. Install and configure [Howdy](https://github.com/boltgolt/howdy)
+2. Enable auto-activation in RingLight GUI
+3. Or run the monitor manually:
+   ```bash
+   ringlight-monitor -v -p howdy
+   ```
+
+The ring light will appear **before** Howdy scans, giving your webcam time to adjust to the light.
+
+## Configuration
+
+Settings are saved to: `~/.config/ringlight/config.ini`
+
+Example:
+```ini
+color=#FFFFFF
+brightness=100
+width=80
+autoEnable=true
+videoDevice=/dev/video0
+processes=howdy
+enabledScreens=DP-1,HDMI-A-1
+minimizeToTray=true
+```
 
 ## Troubleshooting
 
-**Panels don't appear on some monitors**
-- Run `ringlight -l` to see all detected screens
-- Try targeting a specific screen: `ringlight -s 0`
+### Ring light doesn't appear
 
-**Panels appear garbled or wrong size**
-- This can happen with mixed-DPI setups
-- Try targeting screens individually
+1. Check you're running Plasma 6 on Wayland:
+   ```bash
+   echo $XDG_SESSION_TYPE  # Should say "wayland"
+   ```
 
-**Monitor not detecting Howdy**
+2. List available screens:
+   ```bash
+   ringlight-overlay -l
+   ```
+
+3. Test on a specific screen:
+   ```bash
+   ringlight-overlay -s DP-1
+   ```
+
+### Multi-monitor support
+
+RingLight spawns separate overlay processes for each enabled screen. Use screen **index numbers** (0, 1, 2...) rather than names:
+
 ```bash
-# Test manually
-ringlight-monitor -v
+# List screens with indices
+ringlight-overlay -l
+
+# Activate on specific screen by index
+ringlight-overlay -s 0    # First screen
+ringlight-overlay -s 1    # Second screen
+ringlight-overlay -s 2    # Third screen
+```
+
+**Known Limitation on Plasma 6 Wayland:** Due to how layer-shell-qt handles output selection, the overlay may appear on the focused screen rather than the specified screen. This is a limitation of the Wayland layer-shell protocol implementation in KDE.
+
+**Workaround:** Move your terminal/launcher to the target screen before running the overlay command. The GUI handles this by spawning separate processes, but they may still appear on the wrong screen.
+
+If multi-monitor is critical for your use case, consider:
+1. Using a KWin script for screen-specific overlays
+2. Running separate instances from terminals on each monitor
+3. Creating a wrapper script that uses `qdbus` to move windows after creation
+
+```bash
+# Test each screen individually
+ringlight-overlay -s DP-1
+ringlight-overlay -s HDMI-A-1
+```
+
+### Monitor not detecting Howdy
+
+```bash
+# Run with verbose output
+ringlight-monitor -v -p howdy
 
 # Check your video device
 v4l2-ctl --list-devices
-# Use correct device:
-ringlight-monitor -d /dev/video2
+
+# Use correct device
+ringlight-monitor -d /dev/video2 -v
 ```
 
-**Permission denied on /dev/video***
+### Permission denied on /dev/video*
+
 ```bash
 sudo usermod -aG video $USER
 # Log out and back in
 ```
 
-## Configuration
+## Architecture
 
-Edit the systemd service to persist settings:
-```bash
-systemctl --user edit ringlight-monitor
 ```
+┌─────────────────┐
+│  ringlight-gui  │  ← User interface, spawns overlays
+└────────┬────────┘
+         │ spawns
+         ▼
+┌─────────────────┐
+│ringlight-overlay│  ← Layer-shell overlay (one per screen)
+└─────────────────┘
 
-Add:
-```ini
-[Service]
-ExecStart=
-ExecStart=/usr/local/bin/ringlight-monitor -v -a "-s 0 -w 100 -b 80"
+┌─────────────────┐
+│ringlight-monitor│  ← Watches /dev/video* and processes
+└────────┬────────┘
+         │ spawns when active
+         ▼
+┌─────────────────┐
+│ringlight-overlay│
+└─────────────────┘
 ```
 
 ## License
 
 MIT
+
+## Contributing
+
+Pull requests welcome! Please keep the code small and fast.
