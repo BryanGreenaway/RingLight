@@ -107,6 +107,10 @@ private:
                  << "-b" << QString::number(m_brightnessSlider->value())
                  << "-w" << QString::number(m_widthSpin->value());
         
+        if (m_fullscreen->isChecked()) {
+            baseArgs << "-f";
+        }
+        
         // Get enabled screen indices
         QStringList screenIndices;
         for (int i = 0; i < m_screenList->count(); ++i) {
@@ -199,6 +203,7 @@ private:
         s.setValue("color", m_colorBtn->color().name());
         s.setValue("brightness", m_brightnessSlider->value());
         s.setValue("width", m_widthSpin->value());
+        s.setValue("fullscreen", m_fullscreen->isChecked());
         s.setValue("autoEnable", m_autoEnable->isChecked());
         s.setValue("videoDevice", m_videoDevice->currentText());
         s.setValue("processes", m_processEdit->text());
@@ -223,6 +228,7 @@ private:
         m_colorBtn->setColor(QColor(s.value("color", "#FFFFFF").toString()));
         m_brightnessSlider->setValue(s.value("brightness", 100).toInt());
         m_widthSpin->setValue(s.value("width", 80).toInt());
+        m_fullscreen->setChecked(s.value("fullscreen", false).toBool());
         m_autoEnable->setChecked(s.value("autoEnable", false).toBool());
         m_processEdit->setText(s.value("processes", "howdy").toString());
         m_minimizeToTray->setChecked(s.value("minimizeToTray", true).toBool());
@@ -238,6 +244,8 @@ private:
             }
             toggleAutoEnable(m_autoEnable->isChecked());
         });
+        
+        updateWidthEnabled();
     }
     
     void toggleAutoEnable(bool on) {
@@ -245,6 +253,11 @@ private:
         m_processEdit->setEnabled(on);
         on ? startMonitor() : stopMonitor();
         saveSettings();
+    }
+    
+    void updateWidthEnabled() {
+        m_widthSpin->setEnabled(!m_fullscreen->isChecked());
+        m_widthLabel->setEnabled(!m_fullscreen->isChecked());
     }
     
     void setupUI() {
@@ -268,11 +281,17 @@ private:
         // Appearance
         auto *appearGrp = new QGroupBox(tr("Appearance"));
         auto *appearLay = new QGridLayout(appearGrp);
-        appearLay->addWidget(new QLabel(tr("Color:")), 0, 0);
-        m_colorBtn = new ColorButton();
-        appearLay->addWidget(m_colorBtn, 0, 1);
         
-        appearLay->addWidget(new QLabel(tr("Brightness:")), 1, 0);
+        appearLay->addWidget(new QLabel(tr("Mode:")), 0, 0);
+        m_fullscreen = new QCheckBox(tr("Fullscreen (whole monitor lights up)"));
+        connect(m_fullscreen, &QCheckBox::toggled, this, &RingLightGUI::updateWidthEnabled);
+        appearLay->addWidget(m_fullscreen, 0, 1);
+        
+        appearLay->addWidget(new QLabel(tr("Color:")), 1, 0);
+        m_colorBtn = new ColorButton();
+        appearLay->addWidget(m_colorBtn, 1, 1);
+        
+        appearLay->addWidget(new QLabel(tr("Brightness:")), 2, 0);
         auto *brightLay = new QHBoxLayout();
         m_brightnessSlider = new QSlider(Qt::Horizontal);
         m_brightnessSlider->setRange(10, 100);
@@ -281,14 +300,15 @@ private:
         connect(m_brightnessSlider, &QSlider::valueChanged, this, [this](int v) { m_brightnessLabel->setText(QString("%1%").arg(v)); });
         brightLay->addWidget(m_brightnessSlider);
         brightLay->addWidget(m_brightnessLabel);
-        appearLay->addLayout(brightLay, 1, 1);
+        appearLay->addLayout(brightLay, 2, 1);
         
-        appearLay->addWidget(new QLabel(tr("Width:")), 2, 0);
+        m_widthLabel = new QLabel(tr("Border Width:"));
+        appearLay->addWidget(m_widthLabel, 3, 0);
         m_widthSpin = new QSpinBox();
         m_widthSpin->setRange(10, 300);
         m_widthSpin->setValue(80);
         m_widthSpin->setSuffix(" px");
-        appearLay->addWidget(m_widthSpin, 2, 1);
+        appearLay->addWidget(m_widthSpin, 3, 1);
         layout->addWidget(appearGrp);
         
         // Control
@@ -376,6 +396,8 @@ private:
     QSlider *m_brightnessSlider;
     QLabel *m_brightnessLabel;
     QSpinBox *m_widthSpin;
+    QLabel *m_widthLabel;
+    QCheckBox *m_fullscreen;
     QPushButton *m_toggleBtn;
     QCheckBox *m_autoEnable;
     QComboBox *m_videoDevice;

@@ -10,7 +10,7 @@ RestartSec=3
 
 # Can be overridden with systemctl --user edit ringlight-monitor
 # Example overrides:
-# ExecStart=/usr/local/bin/ringlight-monitor -v -s DP-1,HDMI-A-1 -a "-c FFFFFF -b 80"
+# ExecStart=/usr/local/bin/ringlight-monitor -v -s DP-1,HDMI-A-1
 
 [Install]
 WantedBy=default.target

@@ -34,6 +34,7 @@ static int poll_ms = 150;
 static char color[32] = "FFFFFF";
 static int brightness = 100;
 static int width = 80;
+static bool fullscreen = false;
 static char *procs[MAX_ITEMS] = {NULL};
 static int proc_count = 0;
 static char *screens[MAX_ITEMS] = {NULL};
@@ -94,6 +95,7 @@ static void load_config(void) {
     if ((v = get_config(path, "color"))) { strncpy(color, v[0] == '#' ? v+1 : v, sizeof(color)-1); log_msg("  color: %s", color); }
     if ((v = get_config(path, "brightness"))) { brightness = atoi(v); if (brightness < 1) brightness = 1; if (brightness > 100) brightness = 100; }
     if ((v = get_config(path, "width"))) { width = atoi(v); if (width < 10) width = 10; if (width > 500) width = 500; }
+    if ((v = get_config(path, "fullscreen"))) { fullscreen = (strcmp(v, "true") == 0 || strcmp(v, "1") == 0); log_msg("  fullscreen: %s", fullscreen ? "yes" : "no"); }
     if ((v = get_config(path, "videoDevice")) && *v) strncpy(video_dev, v, sizeof(video_dev)-1);
     if ((v = get_config(path, "processes"))) parse_list(v, procs, &proc_count, MAX_ITEMS);
     if ((v = get_config(path, "enabledScreenIndices"))) parse_list(v, screens, &screen_count, MAX_ITEMS);
@@ -200,6 +202,9 @@ static void start_overlay(void) {
         if (p == 0) {
             char *argv[16] = {"ringlight-overlay", "-c", color, "-b", bstr, "-w", wstr};
             int c = 7;
+            if (fullscreen) {
+                argv[c++] = "-f";
+            }
             if (screen_count > 0) {
                 argv[c++] = "-s";
                 argv[c++] = screens[i];
@@ -256,7 +261,8 @@ int main(int argc, char *argv[]) {
     static struct option opts[] = {
         {"device", 1, 0, 'd'}, {"interval", 1, 0, 'i'}, {"process", 1, 0, 'p'},
         {"color", 1, 0, 'c'}, {"brightness", 1, 0, 'b'}, {"width", 1, 0, 'w'},
-        {"screens", 1, 0, 's'}, {"verbose", 0, 0, 'v'}, {"help", 0, 0, 'h'}, {0}
+        {"screens", 1, 0, 's'}, {"fullscreen", 0, 0, 'f'}, {"verbose", 0, 0, 'v'}, 
+        {"help", 0, 0, 'h'}, {0}
     };
     
     // Temp storage for CLI overrides
@@ -264,10 +270,11 @@ int main(int argc, char *argv[]) {
     char *cli_screens[MAX_ITEMS] = {NULL}; int cli_screen_cnt = 0;
     char cli_color[32] = "", cli_dev[256] = "";
     int cli_bright = 0, cli_width = 0;
-    bool has_procs = false, has_screens = false, has_color = false, has_bright = false, has_width = false, has_dev = false;
+    bool cli_fullscreen = false;
+    bool has_procs = false, has_screens = false, has_color = false, has_bright = false, has_width = false, has_dev = false, has_fullscreen = false;
     
     int o;
-    while ((o = getopt_long(argc, argv, "d:i:p:c:b:w:s:vh", opts, NULL)) != -1) {
+    while ((o = getopt_long(argc, argv, "d:i:p:c:b:w:s:fvh", opts, NULL)) != -1) {
         switch (o) {
         case 'd': strncpy(cli_dev, optarg, sizeof(cli_dev)-1); has_dev = true; break;
         case 'i': poll_ms = atoi(optarg); if (poll_ms < 10) poll_ms = 10; break;
@@ -276,8 +283,9 @@ int main(int argc, char *argv[]) {
         case 'b': cli_bright = atoi(optarg); has_bright = true; break;
         case 'w': cli_width = atoi(optarg); has_width = true; break;
         case 's': parse_list(optarg, cli_screens, &cli_screen_cnt, MAX_ITEMS); has_screens = true; break;
+        case 'f': cli_fullscreen = true; has_fullscreen = true; break;
         case 'v': verbose = true; break;
-        case 'h': printf("ringlight-monitor - Auto ring light\nUsage: %s [-d dev] [-i ms] [-p proc] [-c hex] [-b 1-100] [-w px] [-s screens] [-v]\n", argv[0]); return 0;
+        case 'h': printf("ringlight-monitor - Auto ring light\nUsage: %s [-d dev] [-i ms] [-p proc] [-c hex] [-b 1-100] [-w px] [-s screens] [-f] [-v]\n", argv[0]); return 0;
         }
     }
     
@@ -288,6 +296,7 @@ int main(int argc, char *argv[]) {
     if (has_color) strncpy(color, cli_color, sizeof(color)-1);
     if (has_bright) { brightness = cli_bright; if (brightness < 1) brightness = 1; if (brightness > 100) brightness = 100; }
     if (has_width) { width = cli_width; if (width < 10) width = 10; if (width > 500) width = 500; }
+    if (has_fullscreen) fullscreen = cli_fullscreen;
     if (has_procs) { proc_count = 0; for (int i = 0; i < cli_proc_cnt; i++) procs[proc_count++] = cli_procs[i]; }
     if (has_screens) { screen_count = 0; for (int i = 0; i < cli_screen_cnt; i++) screens[screen_count++] = cli_screens[i]; }
     
@@ -296,7 +305,8 @@ int main(int argc, char *argv[]) {
     signal(SIGCHLD, SIG_IGN);
     atexit(cleanup);
     
-    log_msg("Monitoring %s @ %dms, %d proc(s), color=%s bright=%d width=%d", video_dev, poll_ms, proc_count, color, brightness, width);
+    log_msg("Monitoring %s @ %dms, %d proc(s), color=%s bright=%d width=%d fullscreen=%s", 
+            video_dev, poll_ms, proc_count, color, brightness, width, fullscreen ? "yes" : "no");
     
     bool was = false;
     while (running) {
