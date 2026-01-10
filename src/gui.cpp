@@ -1,19 +1,10 @@
 /*
- * RingLight GUI - Settings and control panel for KDE Plasma 6
- * 
- * Features:
- * - Screen selection with per-screen enable
- * - Color and brightness controls  
- * - Howdy integration
- * - System tray with quick toggle
- * - Automatic webcam detection
- *
+ * RingLight GUI - Settings panel for KDE Plasma 6
  * License: MIT
  */
 
 #include <QApplication>
 #include <QMainWindow>
-#include <QWidget>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QGridLayout>
@@ -29,526 +20,357 @@
 #include <QColorDialog>
 #include <QSystemTrayIcon>
 #include <QMenu>
-#include <QAction>
 #include <QScreen>
 #include <QSettings>
 #include <QProcess>
 #include <QTimer>
 #include <QDir>
 #include <QStandardPaths>
-#include <QMessageBox>
 #include <QCloseEvent>
-#include <QFrame>
 #include <QPainter>
-#include <QPixmap>
-#include <QPen>
-#include <QIcon>
 
 class ColorButton : public QPushButton {
     Q_OBJECT
 public:
     ColorButton(QWidget *parent = nullptr) : QPushButton(parent), m_color(Qt::white) {
         setFixedSize(70, 30);
-        updateAppearance();
-        connect(this, &QPushButton::clicked, this, &ColorButton::chooseColor);
+        connect(this, &QPushButton::clicked, this, [this]() {
+            QColor c = QColorDialog::getColor(m_color, this, tr("Ring Light Color"));
+            if (c.isValid()) { m_color = c; update(); emit colorChanged(c); }
+        });
     }
-    
     QColor color() const { return m_color; }
-    void setColor(const QColor &c) { m_color = c; updateAppearance(); emit colorChanged(c); }
-    
+    void setColor(const QColor &c) { m_color = c; update(); emit colorChanged(c); }
 signals:
     void colorChanged(const QColor &color);
-    
-private slots:
-    void chooseColor() {
-        QColorDialog dlg(m_color, this);
-        dlg.setWindowTitle(tr("Ring Light Color"));
-        dlg.setOption(QColorDialog::DontUseNativeDialog, false);
-        if (dlg.exec() == QDialog::Accepted) {
-            setColor(dlg.selectedColor());
-        }
-    }
-    
 protected:
     void paintEvent(QPaintEvent *) override {
         QPainter p(this);
         p.setRenderHint(QPainter::Antialiasing);
-        
-        // Draw color swatch
         p.setBrush(m_color);
         p.setPen(QPen(Qt::gray, 2));
         p.drawRoundedRect(rect().adjusted(2, 2, -2, -2), 4, 4);
     }
-    
 private:
-    void updateAppearance() {
-        update(); // Trigger repaint
-    }
     QColor m_color;
 };
 
 class RingLightGUI : public QMainWindow {
     Q_OBJECT
-    
 public:
-    RingLightGUI(QWidget *parent = nullptr) : QMainWindow(parent) {
+    RingLightGUI() {
         setWindowTitle(tr("RingLight Settings"));
         setMinimumWidth(450);
-        
         setupUI();
         setupTray();
         loadSettings();
-        
-        // Refresh screen list
         refreshScreens();
-        
-        // Check for video devices
         refreshVideoDevices();
     }
-    
-    ~RingLightGUI() {
-        stopRingLight();
-    }
-    
+    ~RingLightGUI() { cleanup(); }
+
 protected:
-    void closeEvent(QCloseEvent *event) override {
+    void closeEvent(QCloseEvent *e) override {
         if (m_tray && m_tray->isVisible() && m_minimizeToTray->isChecked()) {
-            hide();
-            event->ignore();
+            hide(); e->ignore();
         } else {
-            saveSettings();
-            stopRingLight();
-            stopMonitor();
-            event->accept();
+            cleanup(); e->accept();
         }
     }
-    
-private slots:
-    void toggleRingLight() {
-        if (m_running) {
-            stopRingLight();
-        } else {
-            startRingLight();
-        }
-        updateTrayMenu();
+
+private:
+    void cleanup() {
+        saveSettings();
+        stopOverlay();
+        stopMonitor();
     }
     
-    void startRingLight() {
-        stopRingLight();
+    void stopOverlay() {
+        for (QProcess *proc : m_overlays) {
+            proc->terminate();
+            proc->waitForFinished(500);
+            if (proc->state() != QProcess::NotRunning) proc->kill();
+            delete proc;
+        }
+        m_overlays.clear();
+        m_running = false;
+        m_toggleBtn->setText(tr("Turn On"));
+        m_toggleBtn->setStyleSheet("background-color: #27ae60; color: white; padding: 10px; font-weight: bold;");
+        if (m_toggleAction) m_toggleAction->setText(tr("Turn On"));
+    }
+    
+    void startOverlay() {
+        stopOverlay();
         
-        QStringList enabledScreenIndices;
+        QStringList baseArgs;
+        baseArgs << "-c" << m_colorBtn->color().name().mid(1)
+                 << "-b" << QString::number(m_brightnessSlider->value())
+                 << "-w" << QString::number(m_widthSpin->value());
+        
+        // Get enabled screen indices
+        QStringList screenIndices;
         for (int i = 0; i < m_screenList->count(); ++i) {
-            QListWidgetItem *item = m_screenList->item(i);
-            if (item->checkState() == Qt::Checked) {
-                // Store the index, not the name
-                enabledScreenIndices << QString::number(item->data(Qt::UserRole + 1).toInt());
-            }
+            auto *item = m_screenList->item(i);
+            if (item->checkState() == Qt::Checked)
+                screenIndices << QString::number(item->data(Qt::UserRole + 1).toInt());
         }
         
-        if (enabledScreenIndices.isEmpty()) {
-            QMessageBox::warning(this, tr("No Screens"), tr("Please select at least one screen."));
-            return;
-        }
+        // If no screens selected, use screen 0
+        if (screenIndices.isEmpty()) screenIndices << "0";
         
-        QString color = m_colorBtn->color().name().mid(1); // Remove #
-        int brightness = m_brightnessSlider->value();
-        int width = m_widthSpin->value();
-        
-        // Spawn one ringlight-overlay process per screen
-        for (const QString &screenIdx : enabledScreenIndices) {
+        // Spawn ONE process per screen
+        for (const QString &idx : screenIndices) {
             QProcess *proc = new QProcess(this);
-            proc->setProgram(QStringLiteral("ringlight-overlay"));
-            proc->setArguments({
-                QStringLiteral("-s"), screenIdx,
-                QStringLiteral("-c"), color,
-                QStringLiteral("-b"), QString::number(brightness),
-                QStringLiteral("-w"), QString::number(width)
-            });
-            proc->start();
-            m_overlayProcs << proc;
+            QStringList args = baseArgs;
+            args << "-s" << idx;
+            proc->start("ringlight-overlay", args);
+            m_overlays << proc;
         }
         
         m_running = true;
         m_toggleBtn->setText(tr("Turn Off"));
         m_toggleBtn->setStyleSheet("background-color: #c0392b; color: white; padding: 10px; font-weight: bold;");
-        updateTrayMenu();
-    }
-    
-    void stopRingLight() {
-        for (QProcess *proc : m_overlayProcs) {
-            proc->terminate();
-            proc->waitForFinished(500);
-            if (proc->state() != QProcess::NotRunning) {
-                proc->kill();
-            }
-            delete proc;
-        }
-        m_overlayProcs.clear();
-        
-        m_running = false;
-        m_toggleBtn->setText(tr("Turn On"));
-        m_toggleBtn->setStyleSheet("background-color: #27ae60; color: white; padding: 10px; font-weight: bold;");
-        updateTrayMenu();
-    }
-    
-    void refreshScreens() {
-        m_screenList->clear();
-        const auto screens = QGuiApplication::screens();
-        for (int i = 0; i < screens.size(); ++i) {
-            QScreen *s = screens[i];
-            QString label = QString("%1: %2 (%3x%4)")
-                .arg(i)
-                .arg(s->name())
-                .arg(s->size().width())
-                .arg(s->size().height());
-            QListWidgetItem *item = new QListWidgetItem(label);
-            item->setData(Qt::UserRole, s->name());      // Store name for settings
-            item->setData(Qt::UserRole + 1, i);          // Store index for overlay
-            item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
-            item->setCheckState(Qt::Unchecked);
-            m_screenList->addItem(item);
-        }
-        
-        // Check first screen by default if none selected
-        if (m_screenList->count() > 0) {
-            m_screenList->item(0)->setCheckState(Qt::Checked);
-        }
-    }
-    
-    void refreshVideoDevices() {
-        m_videoDevice->clear();
-        QDir devDir("/dev");
-        QStringList videoDevs = devDir.entryList(QStringList() << "video*", QDir::System);
-        for (const QString &dev : videoDevs) {
-            m_videoDevice->addItem("/dev/" + dev);
-        }
-        if (m_videoDevice->count() == 0) {
-            m_videoDevice->addItem(tr("No webcam found"));
-        }
-    }
-    
-    void toggleAutoEnable(bool enabled) {
-        m_videoDevice->setEnabled(enabled);
-        m_processEdit->setEnabled(enabled);
-        
-        if (enabled) {
-            startMonitor();
-        } else {
-            stopMonitor();
-        }
-        saveSettings();
-    }
-    
-    void startMonitor() {
-        stopMonitor();
-        
-        if (!m_autoEnable->isChecked()) return;
-        
-        // Save settings first so monitor can read them
-        saveSettings();
-        
-        m_monitorProc = new QProcess(this);
-        m_monitorProc->setProgram(QStringLiteral("ringlight-monitor"));
-        
-        // Monitor reads config file by default, just add verbose flag
-        m_monitorProc->setArguments({QStringLiteral("-v")});
-        
-        connect(m_monitorProc, &QProcess::errorOccurred, this, [this](QProcess::ProcessError err) {
-            Q_UNUSED(err);
-            m_monitorStatus->setText(tr("Monitor: Error - %1").arg(m_monitorProc->errorString()));
-            m_monitorStatus->setStyleSheet("color: #c0392b;");
-        });
-        
-        m_monitorProc->start();
-        
-        if (m_monitorProc->waitForStarted(1000)) {
-            m_monitorStatus->setText(tr("Monitor: Running"));
-            m_monitorStatus->setStyleSheet("color: #27ae60;");
-        } else {
-            m_monitorStatus->setText(tr("Monitor: Failed to start"));
-            m_monitorStatus->setStyleSheet("color: #c0392b;");
-        }
+        if (m_toggleAction) m_toggleAction->setText(tr("Turn Off"));
     }
     
     void stopMonitor() {
-        if (m_monitorProc) {
-            m_monitorProc->terminate();
-            m_monitorProc->waitForFinished(500);
-            if (m_monitorProc->state() != QProcess::NotRunning) {
-                m_monitorProc->kill();
-            }
-            delete m_monitorProc;
-            m_monitorProc = nullptr;
+        if (m_monitor) {
+            m_monitor->terminate();
+            m_monitor->waitForFinished(500);
+            if (m_monitor->state() != QProcess::NotRunning) m_monitor->kill();
+            delete m_monitor;
+            m_monitor = nullptr;
         }
         m_monitorStatus->setText(tr("Monitor: Stopped"));
         m_monitorStatus->setStyleSheet("color: #888;");
     }
     
+    void startMonitor() {
+        stopMonitor();
+        if (!m_autoEnable->isChecked()) return;
+        saveSettings();
+        
+        m_monitor = new QProcess(this);
+        connect(m_monitor, &QProcess::errorOccurred, this, [this]() {
+            m_monitorStatus->setText(tr("Monitor: Error"));
+            m_monitorStatus->setStyleSheet("color: #c0392b;");
+        });
+        m_monitor->start("ringlight-monitor", {"-v"});
+        
+        m_monitorStatus->setText(m_monitor->waitForStarted(1000) ? tr("Monitor: Running") : tr("Monitor: Failed"));
+        m_monitorStatus->setStyleSheet(m_monitor->state() == QProcess::Running ? "color: #27ae60;" : "color: #c0392b;");
+    }
+    
+    void refreshScreens() {
+        QStringList prev;
+        for (int i = 0; i < m_screenList->count(); ++i)
+            if (m_screenList->item(i)->checkState() == Qt::Checked)
+                prev << m_screenList->item(i)->data(Qt::UserRole).toString();
+        
+        m_screenList->clear();
+        const auto screens = QGuiApplication::screens();
+        for (int i = 0; i < screens.size(); ++i) {
+            QScreen *s = screens[i];
+            auto *item = new QListWidgetItem(QString("%1: %2 (%3x%4)").arg(i).arg(s->name()).arg(s->size().width()).arg(s->size().height()));
+            item->setData(Qt::UserRole, s->name());
+            item->setData(Qt::UserRole + 1, i);
+            item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
+            item->setCheckState(prev.contains(s->name()) ? Qt::Checked : Qt::Unchecked);
+            m_screenList->addItem(item);
+        }
+        
+        bool any = false;
+        for (int i = 0; i < m_screenList->count(); ++i) if (m_screenList->item(i)->checkState() == Qt::Checked) { any = true; break; }
+        if (!any && m_screenList->count() > 0) m_screenList->item(0)->setCheckState(Qt::Checked);
+    }
+    
+    void refreshVideoDevices() {
+        m_videoDevice->clear();
+        for (const QString &d : QDir("/dev").entryList({"video*"}, QDir::System))
+            m_videoDevice->addItem("/dev/" + d);
+        if (m_videoDevice->count() == 0) m_videoDevice->addItem(tr("No webcam found"));
+    }
+    
     void saveSettings() {
-        QString configPath = QStandardPaths::writableLocation(QStandardPaths::ConfigLocation);
-        QDir().mkpath(configPath + "/ringlight");
-        QSettings settings(configPath + "/ringlight/config.ini", QSettings::IniFormat);
+        QString path = QStandardPaths::writableLocation(QStandardPaths::ConfigLocation);
+        QDir().mkpath(path + "/ringlight");
+        QSettings s(path + "/ringlight/config.ini", QSettings::IniFormat);
         
-        settings.setValue("color", m_colorBtn->color().name());
-        settings.setValue("brightness", m_brightnessSlider->value());
-        settings.setValue("width", m_widthSpin->value());
-        settings.setValue("autoEnable", m_autoEnable->isChecked());
-        settings.setValue("videoDevice", m_videoDevice->currentText());
-        settings.setValue("processes", m_processEdit->text());
-        settings.setValue("minimizeToTray", m_minimizeToTray->isChecked());
+        s.setValue("color", m_colorBtn->color().name());
+        s.setValue("brightness", m_brightnessSlider->value());
+        s.setValue("width", m_widthSpin->value());
+        s.setValue("autoEnable", m_autoEnable->isChecked());
+        s.setValue("videoDevice", m_videoDevice->currentText());
+        s.setValue("processes", m_processEdit->text());
+        s.setValue("minimizeToTray", m_minimizeToTray->isChecked());
         
-        // Save enabled screens (both names for display and indices for overlay)
-        QStringList enabledNames;
-        QStringList enabledIndices;
+        QStringList names, indices;
         for (int i = 0; i < m_screenList->count(); ++i) {
-            QListWidgetItem *item = m_screenList->item(i);
+            auto *item = m_screenList->item(i);
             if (item->checkState() == Qt::Checked) {
-                enabledNames << item->data(Qt::UserRole).toString();
-                enabledIndices << QString::number(item->data(Qt::UserRole + 1).toInt());
+                names << item->data(Qt::UserRole).toString();
+                indices << QString::number(item->data(Qt::UserRole + 1).toInt());
             }
         }
-        settings.setValue("enabledScreens", enabledNames.join(','));
-        settings.setValue("enabledScreenIndices", enabledIndices.join(','));
-        
-        settings.sync();
+        s.setValue("enabledScreens", names.join(','));
+        s.setValue("enabledScreenIndices", indices.join(','));
     }
     
     void loadSettings() {
-        QString configPath = QStandardPaths::writableLocation(QStandardPaths::ConfigLocation);
-        QSettings settings(configPath + "/ringlight/config.ini", QSettings::IniFormat);
+        QString path = QStandardPaths::writableLocation(QStandardPaths::ConfigLocation);
+        QSettings s(path + "/ringlight/config.ini", QSettings::IniFormat);
         
-        QColor color(settings.value("color", "#FFFFFF").toString());
-        m_colorBtn->setColor(color);
+        m_colorBtn->setColor(QColor(s.value("color", "#FFFFFF").toString()));
+        m_brightnessSlider->setValue(s.value("brightness", 100).toInt());
+        m_widthSpin->setValue(s.value("width", 80).toInt());
+        m_autoEnable->setChecked(s.value("autoEnable", false).toBool());
+        m_processEdit->setText(s.value("processes", "howdy").toString());
+        m_minimizeToTray->setChecked(s.value("minimizeToTray", true).toBool());
         
-        m_brightnessSlider->setValue(settings.value("brightness", 100).toInt());
-        m_widthSpin->setValue(settings.value("width", 80).toInt());
-        m_autoEnable->setChecked(settings.value("autoEnable", false).toBool());
-        m_processEdit->setText(settings.value("processes", "howdy").toString());
-        m_minimizeToTray->setChecked(settings.value("minimizeToTray", true).toBool());
-        
-        QString videoDev = settings.value("videoDevice", "/dev/video0").toString();
-        int idx = m_videoDevice->findText(videoDev);
+        int idx = m_videoDevice->findText(s.value("videoDevice", "/dev/video0").toString());
         if (idx >= 0) m_videoDevice->setCurrentIndex(idx);
         
-        // Get enabled screens from settings
-        QString enabledStr = settings.value("enabledScreens", "").toString();
-        QStringList enabled = enabledStr.split(',', Qt::SkipEmptyParts);
-        
-        // Restore enabled screens after refresh (use singleShot to let screen list populate)
+        QStringList enabled = s.value("enabledScreens", "").toString().split(',', Qt::SkipEmptyParts);
         QTimer::singleShot(100, this, [this, enabled]() {
             for (int i = 0; i < m_screenList->count(); ++i) {
-                QListWidgetItem *item = m_screenList->item(i);
-                QString name = item->data(Qt::UserRole).toString();
-                item->setCheckState(enabled.contains(name) ? Qt::Checked : Qt::Unchecked);
+                auto *item = m_screenList->item(i);
+                item->setCheckState(enabled.contains(item->data(Qt::UserRole).toString()) ? Qt::Checked : Qt::Unchecked);
             }
-            
-            // Now safe to toggle auto-enable
             toggleAutoEnable(m_autoEnable->isChecked());
         });
     }
     
-    void updateTrayMenu() {
-        if (m_toggleAction) {
-            m_toggleAction->setText(m_running ? tr("Turn Off") : tr("Turn On"));
-        }
+    void toggleAutoEnable(bool on) {
+        m_videoDevice->setEnabled(on);
+        m_processEdit->setEnabled(on);
+        on ? startMonitor() : stopMonitor();
+        saveSettings();
     }
     
-    void trayActivated(QSystemTrayIcon::ActivationReason reason) {
-        if (reason == QSystemTrayIcon::Trigger) {
-            if (isVisible()) {
-                hide();
-            } else {
-                show();
-                raise();
-                activateWindow();
-            }
-        }
-    }
-    
-private:
     void setupUI() {
-        QWidget *central = new QWidget(this);
+        auto *central = new QWidget(this);
         setCentralWidget(central);
+        auto *layout = new QVBoxLayout(central);
+        layout->setSpacing(12);
         
-        QVBoxLayout *mainLayout = new QVBoxLayout(central);
-        mainLayout->setSpacing(12);
-        
-        // === Screens Section ===
-        QGroupBox *screenGroup = new QGroupBox(tr("Screens"));
-        QVBoxLayout *screenLayout = new QVBoxLayout(screenGroup);
-        
+        // Screens
+        auto *screenGrp = new QGroupBox(tr("Screens"));
+        auto *screenLay = new QVBoxLayout(screenGrp);
         m_screenList = new QListWidget();
         m_screenList->setMaximumHeight(120);
-        screenLayout->addWidget(m_screenList);
-        
-        QPushButton *refreshBtn = new QPushButton(tr("Refresh"));
+        screenLay->addWidget(m_screenList);
+        auto *refreshBtn = new QPushButton(tr("Refresh"));
         refreshBtn->setMaximumWidth(100);
         connect(refreshBtn, &QPushButton::clicked, this, &RingLightGUI::refreshScreens);
-        screenLayout->addWidget(refreshBtn);
+        screenLay->addWidget(refreshBtn);
+        layout->addWidget(screenGrp);
         
-        mainLayout->addWidget(screenGroup);
-        
-        // === Appearance Section ===
-        QGroupBox *appearGroup = new QGroupBox(tr("Appearance"));
-        QGridLayout *appearLayout = new QGridLayout(appearGroup);
-        
-        appearLayout->addWidget(new QLabel(tr("Color:")), 0, 0);
+        // Appearance
+        auto *appearGrp = new QGroupBox(tr("Appearance"));
+        auto *appearLay = new QGridLayout(appearGrp);
+        appearLay->addWidget(new QLabel(tr("Color:")), 0, 0);
         m_colorBtn = new ColorButton();
-        appearLayout->addWidget(m_colorBtn, 0, 1);
+        appearLay->addWidget(m_colorBtn, 0, 1);
         
-        appearLayout->addWidget(new QLabel(tr("Brightness:")), 1, 0);
-        QHBoxLayout *brightLayout = new QHBoxLayout();
+        appearLay->addWidget(new QLabel(tr("Brightness:")), 1, 0);
+        auto *brightLay = new QHBoxLayout();
         m_brightnessSlider = new QSlider(Qt::Horizontal);
         m_brightnessSlider->setRange(10, 100);
         m_brightnessSlider->setValue(100);
         m_brightnessLabel = new QLabel("100%");
-        m_brightnessLabel->setMinimumWidth(40);
-        connect(m_brightnessSlider, &QSlider::valueChanged, this, [this](int v) {
-            m_brightnessLabel->setText(QString("%1%").arg(v));
-        });
-        brightLayout->addWidget(m_brightnessSlider);
-        brightLayout->addWidget(m_brightnessLabel);
-        appearLayout->addLayout(brightLayout, 1, 1);
+        connect(m_brightnessSlider, &QSlider::valueChanged, this, [this](int v) { m_brightnessLabel->setText(QString("%1%").arg(v)); });
+        brightLay->addWidget(m_brightnessSlider);
+        brightLay->addWidget(m_brightnessLabel);
+        appearLay->addLayout(brightLay, 1, 1);
         
-        appearLayout->addWidget(new QLabel(tr("Width:")), 2, 0);
+        appearLay->addWidget(new QLabel(tr("Width:")), 2, 0);
         m_widthSpin = new QSpinBox();
         m_widthSpin->setRange(10, 300);
         m_widthSpin->setValue(80);
         m_widthSpin->setSuffix(" px");
-        appearLayout->addWidget(m_widthSpin, 2, 1);
+        appearLay->addWidget(m_widthSpin, 2, 1);
+        layout->addWidget(appearGrp);
         
-        mainLayout->addWidget(appearGroup);
-        
-        // === Manual Control ===
-        QGroupBox *controlGroup = new QGroupBox(tr("Manual Control"));
-        QHBoxLayout *controlLayout = new QHBoxLayout(controlGroup);
-        
+        // Control
+        auto *ctrlGrp = new QGroupBox(tr("Manual Control"));
+        auto *ctrlLay = new QHBoxLayout(ctrlGrp);
         m_toggleBtn = new QPushButton(tr("Turn On"));
         m_toggleBtn->setStyleSheet("background-color: #27ae60; color: white; padding: 10px; font-weight: bold;");
-        connect(m_toggleBtn, &QPushButton::clicked, this, &RingLightGUI::toggleRingLight);
-        controlLayout->addWidget(m_toggleBtn);
+        connect(m_toggleBtn, &QPushButton::clicked, this, [this]() { m_running ? stopOverlay() : startOverlay(); });
+        ctrlLay->addWidget(m_toggleBtn);
+        layout->addWidget(ctrlGrp);
         
-        mainLayout->addWidget(controlGroup);
-        
-        // === Auto-Enable Section ===
-        QGroupBox *autoGroup = new QGroupBox(tr("Automatic Activation"));
-        QVBoxLayout *autoLayout = new QVBoxLayout(autoGroup);
-        
+        // Auto
+        auto *autoGrp = new QGroupBox(tr("Automatic Activation"));
+        auto *autoLay = new QVBoxLayout(autoGrp);
         m_autoEnable = new QCheckBox(tr("Enable when webcam is active"));
         connect(m_autoEnable, &QCheckBox::toggled, this, &RingLightGUI::toggleAutoEnable);
-        autoLayout->addWidget(m_autoEnable);
+        autoLay->addWidget(m_autoEnable);
         
-        QGridLayout *autoGrid = new QGridLayout();
-        
+        auto *autoGrid = new QGridLayout();
         autoGrid->addWidget(new QLabel(tr("Video device:")), 0, 0);
         m_videoDevice = new QComboBox();
+        m_videoDevice->setEnabled(false);
         autoGrid->addWidget(m_videoDevice, 0, 1);
-        
         autoGrid->addWidget(new QLabel(tr("Watch processes:")), 1, 0);
         m_processEdit = new QLineEdit("howdy");
-        m_processEdit->setPlaceholderText("howdy, zoom, teams");
+        m_processEdit->setEnabled(false);
         autoGrid->addWidget(m_processEdit, 1, 1);
-        
-        autoLayout->addLayout(autoGrid);
+        autoLay->addLayout(autoGrid);
         
         m_monitorStatus = new QLabel(tr("Monitor: Stopped"));
         m_monitorStatus->setStyleSheet("color: #888;");
-        autoLayout->addWidget(m_monitorStatus);
+        autoLay->addWidget(m_monitorStatus);
+        layout->addWidget(autoGrp);
         
-        // Initially disable
-        m_videoDevice->setEnabled(false);
-        m_processEdit->setEnabled(false);
-        
-        mainLayout->addWidget(autoGroup);
-        
-        // === Options ===
-        QGroupBox *optGroup = new QGroupBox(tr("Options"));
-        QVBoxLayout *optLayout = new QVBoxLayout(optGroup);
-        
+        // Options
+        auto *optGrp = new QGroupBox(tr("Options"));
+        auto *optLay = new QVBoxLayout(optGrp);
         m_minimizeToTray = new QCheckBox(tr("Minimize to system tray"));
         m_minimizeToTray->setChecked(true);
-        optLayout->addWidget(m_minimizeToTray);
+        optLay->addWidget(m_minimizeToTray);
+        layout->addWidget(optGrp);
         
-        mainLayout->addWidget(optGroup);
-        
-        // === Buttons ===
-        QHBoxLayout *btnLayout = new QHBoxLayout();
-        
-        QPushButton *saveBtn = new QPushButton(tr("Save Settings"));
-        connect(saveBtn, &QPushButton::clicked, this, [this]() {
-            saveSettings();
-            if (m_autoEnable->isChecked()) {
-                startMonitor(); // Restart with new settings
-            }
-        });
-        btnLayout->addWidget(saveBtn);
-        
-        QPushButton *quitBtn = new QPushButton(tr("Quit"));
-        connect(quitBtn, &QPushButton::clicked, this, [this]() {
-            saveSettings();
-            stopRingLight();
-            stopMonitor();
-            qApp->quit();
-        });
-        btnLayout->addWidget(quitBtn);
-        
-        mainLayout->addLayout(btnLayout);
+        // Buttons
+        auto *btnLay = new QHBoxLayout();
+        auto *saveBtn = new QPushButton(tr("Save Settings"));
+        connect(saveBtn, &QPushButton::clicked, this, [this]() { saveSettings(); if (m_autoEnable->isChecked()) startMonitor(); });
+        btnLay->addWidget(saveBtn);
+        auto *quitBtn = new QPushButton(tr("Quit"));
+        connect(quitBtn, &QPushButton::clicked, this, [this]() { cleanup(); qApp->quit(); });
+        btnLay->addWidget(quitBtn);
+        layout->addLayout(btnLay);
     }
     
     void setupTray() {
-        // Check if system tray is available
-        if (!QSystemTrayIcon::isSystemTrayAvailable()) {
-            m_tray = nullptr;
-            return;
-        }
+        if (!QSystemTrayIcon::isSystemTrayAvailable()) return;
         
         m_tray = new QSystemTrayIcon(this);
-        
-        // Create a simple icon (white circle)
-        QPixmap pixmap(32, 32);
-        pixmap.fill(Qt::transparent);
-        QPainter painter(&pixmap);
-        painter.setRenderHint(QPainter::Antialiasing);
-        painter.setBrush(Qt::white);
-        painter.setPen(QPen(Qt::gray, 2));
-        painter.drawEllipse(2, 2, 28, 28);
-        painter.end();
-        
-        m_tray->setIcon(QIcon(pixmap));
+        QPixmap px(32, 32);
+        px.fill(Qt::transparent);
+        QPainter p(&px);
+        p.setRenderHint(QPainter::Antialiasing);
+        p.setBrush(Qt::white);
+        p.setPen(QPen(Qt::gray, 2));
+        p.drawEllipse(2, 2, 28, 28);
+        m_tray->setIcon(QIcon(px));
         m_tray->setToolTip(tr("RingLight"));
         
-        QMenu *menu = new QMenu();
-        
+        auto *menu = new QMenu();
         m_toggleAction = menu->addAction(tr("Turn On"));
-        connect(m_toggleAction, &QAction::triggered, this, &RingLightGUI::toggleRingLight);
-        
+        connect(m_toggleAction, &QAction::triggered, this, [this]() { m_running ? stopOverlay() : startOverlay(); });
         menu->addSeparator();
-        
-        QAction *showAction = menu->addAction(tr("Settings..."));
-        connect(showAction, &QAction::triggered, this, [this]() {
-            show();
-            raise();
-            activateWindow();
-        });
-        
+        connect(menu->addAction(tr("Settings...")), &QAction::triggered, this, [this]() { show(); raise(); activateWindow(); });
         menu->addSeparator();
-        
-        QAction *quitAction = menu->addAction(tr("Quit"));
-        connect(quitAction, &QAction::triggered, this, [this]() {
-            saveSettings();
-            stopRingLight();
-            stopMonitor();
-            qApp->quit();
-        });
-        
+        connect(menu->addAction(tr("Quit")), &QAction::triggered, this, [this]() { cleanup(); qApp->quit(); });
         m_tray->setContextMenu(menu);
         
-        connect(m_tray, &QSystemTrayIcon::activated, this, &RingLightGUI::trayActivated);
-        
+        connect(m_tray, &QSystemTrayIcon::activated, this, [this](QSystemTrayIcon::ActivationReason r) {
+            if (r == QSystemTrayIcon::Trigger) isVisible() ? hide() : (show(), raise(), activateWindow());
+        });
         m_tray->show();
     }
     
-    // UI elements
     QListWidget *m_screenList;
     ColorButton *m_colorBtn;
     QSlider *m_brightnessSlider;
@@ -560,26 +382,19 @@ private:
     QLineEdit *m_processEdit;
     QLabel *m_monitorStatus;
     QCheckBox *m_minimizeToTray;
-    
-    // Tray
     QSystemTrayIcon *m_tray = nullptr;
     QAction *m_toggleAction = nullptr;
-    
-    // State
     bool m_running = false;
-    QList<QProcess*> m_overlayProcs;
-    QProcess *m_monitorProc = nullptr;
+    QProcess *m_monitor = nullptr;
+    QList<QProcess*> m_overlays;
 };
 
 int main(int argc, char *argv[]) {
     QApplication app(argc, argv);
-    app.setApplicationName(QStringLiteral("ringlight-gui"));
-    app.setApplicationVersion(QStringLiteral("1.0"));
+    app.setApplicationName("ringlight-gui");
     app.setQuitOnLastWindowClosed(false);
-    
     RingLightGUI gui;
     gui.show();
-    
     return app.exec();
 }
 
