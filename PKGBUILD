@@ -4,7 +4,7 @@ pkgver=1.0.0
 pkgrel=1
 pkgdesc="Screen ring light for KDE Plasma 6 with Howdy integration"
 arch=('x86_64')
-license=('MIT')
+license=('GPL-3')
 depends=('qt6-base' 'wayland')
 makedepends=('cmake' 'wayland-protocols' 'pkgconf')
 

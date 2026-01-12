@@ -45,9 +45,16 @@ static void sig_handler(int s) { (void)s; running = 0; }
 #define log_msg(...) do { if (verbose) { fprintf(stderr, "[ringlight-monitor] " __VA_ARGS__); fprintf(stderr, "\n"); } } while(0)
 
 static char *trim(char *s) {
-    while (*s == ' ' || *s == '\t') s++;
+    while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') s++;
+    if (!*s) return s;  // Handle empty string
     char *e = s + strlen(s) - 1;
-    while (e > s && (*e == '\n' || *e == '\r' || *e == ' ')) *e-- = '\0';
+    while (e > s && (*e == '\n' || *e == '\r' || *e == ' ' || *e == '\t')) *e-- = '\0';
+    // Strip surrounding quotes (QSettings adds them for comma-separated values)
+    size_t len = strlen(s);
+    if (len >= 2 && s[0] == '"' && s[len-1] == '"') {
+        s[len-1] = '\0';
+        s++;
+    }
     return s;
 }
 
@@ -98,8 +105,19 @@ static void load_config(void) {
     if ((v = get_config(path, "fullscreen"))) { fullscreen = (strcmp(v, "true") == 0 || strcmp(v, "1") == 0); log_msg("  fullscreen: %s", fullscreen ? "yes" : "no"); }
     if ((v = get_config(path, "videoDevice")) && *v) strncpy(video_dev, v, sizeof(video_dev)-1);
     if ((v = get_config(path, "processes"))) parse_list(v, procs, &proc_count, MAX_ITEMS);
-    if ((v = get_config(path, "enabledScreenIndices"))) parse_list(v, screens, &screen_count, MAX_ITEMS);
-    else if ((v = get_config(path, "enabledScreens"))) parse_list(v, screens, &screen_count, MAX_ITEMS);
+    // Use screen names (enabledScreens) instead of indices for reliable targeting
+    if ((v = get_config(path, "enabledScreens"))) {
+        parse_list(v, screens, &screen_count, MAX_ITEMS);
+        log_msg("  enabledScreens: '%s' -> %d screen(s)", v, screen_count);
+    }
+    else if ((v = get_config(path, "enabledScreenIndices"))) {
+        parse_list(v, screens, &screen_count, MAX_ITEMS);
+        log_msg("  enabledScreenIndices: '%s' -> %d screen(s)", v, screen_count);
+    }
+    
+    for (int i = 0; i < screen_count; i++) {
+        log_msg("    screen[%d] = '%s'", i, screens[i]);
+    }
     
     if (proc_count == 0) procs[proc_count++] = "howdy";
 }
@@ -185,13 +203,13 @@ static void start_overlay(void) {
     // Check if already running
     if (overlay_count > 0 && overlay_pids[0] > 0 && kill(overlay_pids[0], 0) == 0) return;
     
-    log_msg("Starting overlay(s)");
+    log_msg("Starting overlay(s) - %d configured screen(s)", screen_count);
     
     char bstr[16], wstr[16];
     snprintf(bstr, sizeof(bstr), "%d", brightness);
     snprintf(wstr, sizeof(wstr), "%d", width);
     
-    // Spawn one process per screen (or just one if no screens specified)
+    // Spawn one process per screen (or just one with default if no screens specified)
     int num_screens = screen_count > 0 ? screen_count : 1;
     overlay_count = 0;
     
@@ -205,7 +223,7 @@ static void start_overlay(void) {
             if (fullscreen) {
                 argv[c++] = "-f";
             }
-            if (screen_count > 0) {
+            if (screen_count > 0 && screens[i] && screens[i][0]) {
                 argv[c++] = "-s";
                 argv[c++] = screens[i];
             }
@@ -215,7 +233,11 @@ static void start_overlay(void) {
         }
         
         overlay_pids[overlay_count++] = p;
-        log_msg("Started PID %d for screen %s", p, screen_count > 0 ? screens[i] : "default");
+        if (screen_count > 0 && screens[i]) {
+            log_msg("Started PID %d for screen '%s'", p, screens[i]);
+        } else {
+            log_msg("Started PID %d for default screen", p);
+        }
     }
 }
 

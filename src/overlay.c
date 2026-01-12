@@ -2,6 +2,7 @@
  * RingLight Overlay - Pure Wayland layer-shell overlay
  * 
  * Uses wlr-layer-shell protocol directly for proper multi-monitor support.
+ * Click anywhere on the overlay to close.
  * License: MIT
  */
 
@@ -21,6 +22,7 @@
 #include <time.h>
 
 #include <wayland-client.h>
+#include "xdg-shell-client.h"
 #include "wlr-layer-shell-unstable-v1-client.h"
 
 /* ========== Configuration ========== */
@@ -29,7 +31,6 @@ static int cfg_border_width = 80;
 static int cfg_brightness = 100;
 static uint32_t cfg_color = 0xFFFFFF;  // RGB
 static bool cfg_fullscreen = false;
-static int cfg_target_output = -1;  // -1 = use first/default
 static char cfg_target_name[64] = "";
 static bool cfg_list_only = false;
 static bool cfg_verbose = false;
@@ -40,6 +41,8 @@ static struct wl_display *wl_display = NULL;
 static struct wl_registry *wl_registry = NULL;
 static struct wl_compositor *wl_compositor = NULL;
 static struct wl_shm *wl_shm = NULL;
+static struct wl_seat *wl_seat = NULL;
+static struct wl_pointer *wl_pointer = NULL;
 static struct zwlr_layer_shell_v1 *layer_shell = NULL;
 
 static volatile sig_atomic_t running = 1;
@@ -81,6 +84,9 @@ typedef struct {
 #define MAX_PANELS 5
 static panel_t *panels[MAX_PANELS];
 static int num_panels = 0;
+
+/* Track which surface the pointer is over */
+static struct wl_surface *pointer_surface = NULL;
 
 /* ========== Helpers ========== */
 
@@ -198,6 +204,108 @@ static void destroy_panel_buffer(panel_t *panel) {
     }
 }
 
+/* ========== Pointer (Mouse) Callbacks ========== */
+
+static void pointer_enter(void *data, struct wl_pointer *pointer,
+                         uint32_t serial, struct wl_surface *surface,
+                         wl_fixed_t sx, wl_fixed_t sy) {
+    (void)data; (void)pointer; (void)serial; (void)sx; (void)sy;
+    pointer_surface = surface;
+    LOG("Pointer entered surface %p\n", (void*)surface);
+}
+
+static void pointer_leave(void *data, struct wl_pointer *pointer,
+                         uint32_t serial, struct wl_surface *surface) {
+    (void)data; (void)pointer; (void)serial; (void)surface;
+    pointer_surface = NULL;
+    LOG("Pointer left surface\n");
+}
+
+static void pointer_motion(void *data, struct wl_pointer *pointer,
+                          uint32_t time, wl_fixed_t sx, wl_fixed_t sy) {
+    (void)data; (void)pointer; (void)time; (void)sx; (void)sy;
+    /* We don't need motion tracking */
+}
+
+static void pointer_button(void *data, struct wl_pointer *pointer,
+                          uint32_t serial, uint32_t time, uint32_t button,
+                          uint32_t state) {
+    (void)data; (void)pointer; (void)serial; (void)time; (void)button;
+    
+    /* Check if button was pressed (not released) */
+    if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
+        /* Check if pointer is over one of our surfaces */
+        for (int i = 0; i < num_panels; i++) {
+            if (panels[i] && panels[i]->wl_surface == pointer_surface) {
+                LOG("Click detected on panel %d - quitting\n", i);
+                running = 0;
+                return;
+            }
+        }
+    }
+}
+
+static void pointer_axis(void *data, struct wl_pointer *pointer,
+                        uint32_t time, uint32_t axis, wl_fixed_t value) {
+    (void)data; (void)pointer; (void)time; (void)axis; (void)value;
+}
+
+static void pointer_frame(void *data, struct wl_pointer *pointer) {
+    (void)data; (void)pointer;
+}
+
+static void pointer_axis_source(void *data, struct wl_pointer *pointer,
+                               uint32_t axis_source) {
+    (void)data; (void)pointer; (void)axis_source;
+}
+
+static void pointer_axis_stop(void *data, struct wl_pointer *pointer,
+                             uint32_t time, uint32_t axis) {
+    (void)data; (void)pointer; (void)time; (void)axis;
+}
+
+static void pointer_axis_discrete(void *data, struct wl_pointer *pointer,
+                                 uint32_t axis, int32_t discrete) {
+    (void)data; (void)pointer; (void)axis; (void)discrete;
+}
+
+static const struct wl_pointer_listener pointer_listener = {
+    .enter = pointer_enter,
+    .leave = pointer_leave,
+    .motion = pointer_motion,
+    .button = pointer_button,
+    .axis = pointer_axis,
+    .frame = pointer_frame,
+    .axis_source = pointer_axis_source,
+    .axis_stop = pointer_axis_stop,
+    .axis_discrete = pointer_axis_discrete,
+};
+
+/* ========== Seat Callbacks ========== */
+
+static void seat_capabilities(void *data, struct wl_seat *seat, uint32_t caps) {
+    (void)data;
+    
+    if ((caps & WL_SEAT_CAPABILITY_POINTER) && !wl_pointer) {
+        wl_pointer = wl_seat_get_pointer(seat);
+        wl_pointer_add_listener(wl_pointer, &pointer_listener, NULL);
+        LOG("Pointer capability detected, listener added\n");
+    } else if (!(caps & WL_SEAT_CAPABILITY_POINTER) && wl_pointer) {
+        wl_pointer_destroy(wl_pointer);
+        wl_pointer = NULL;
+    }
+}
+
+static void seat_name(void *data, struct wl_seat *seat, const char *name) {
+    (void)data; (void)seat;
+    LOG("Seat name: %s\n", name);
+}
+
+static const struct wl_seat_listener seat_listener = {
+    .capabilities = seat_capabilities,
+    .name = seat_name,
+};
+
 /* ========== Layer Surface Callbacks ========== */
 
 static void layer_surface_configure(void *data, struct zwlr_layer_surface_v1 *surface,
@@ -305,6 +413,7 @@ static void output_name(void *data, struct wl_output *wl_output, const char *nam
     output_t *output = find_output_by_wl(wl_output);
     if (output && name) {
         strncpy(output->name, name, sizeof(output->name) - 1);
+        LOG("Output name received: %s\n", name);
     }
 }
 
@@ -334,7 +443,13 @@ static void registry_global(void *data, struct wl_registry *registry,
     } 
     else if (strcmp(interface, wl_shm_interface.name) == 0) {
         wl_shm = wl_registry_bind(registry, name, &wl_shm_interface, 1);
-    } 
+    }
+    else if (strcmp(interface, wl_seat_interface.name) == 0) {
+        wl_seat = wl_registry_bind(registry, name, &wl_seat_interface, 
+                                   version < 5 ? version : 5);
+        wl_seat_add_listener(wl_seat, &seat_listener, NULL);
+        LOG("Seat bound, listener added\n");
+    }
     else if (strcmp(interface, wl_output_interface.name) == 0) {
         if (num_outputs < MAX_OUTPUTS) {
             output_t *output = &outputs[num_outputs++];
@@ -384,11 +499,14 @@ static panel_t *create_panel(output_t *output, uint32_t anchor, uint32_t width, 
         return NULL;
     }
     
-    /* Create layer surface */
+    /* Create layer surface - PASS THE SPECIFIC OUTPUT */
+    LOG("Creating layer surface on output: %s (wl_output=%p)\n", 
+        output ? output->name : "NULL", output ? (void*)output->wl_output : NULL);
+    
     panel->layer_surface = zwlr_layer_shell_v1_get_layer_surface(
         layer_shell,
         panel->wl_surface,
-        output ? output->wl_output : NULL,  /* NULL = compositor chooses */
+        output ? output->wl_output : NULL,
         ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY,
         "ringlight"
     );
@@ -411,7 +529,8 @@ static panel_t *create_panel(output_t *output, uint32_t anchor, uint32_t width, 
     /* Initial commit to trigger configure event */
     wl_surface_commit(panel->wl_surface);
     
-    LOG("Created panel %ux%u anchor=0x%x\n", width, height, anchor);
+    LOG("Created panel %ux%u anchor=0x%x on %s\n", width, height, anchor,
+        output ? output->name : "default");
     return panel;
 }
 
@@ -432,9 +551,16 @@ static void destroy_panel(panel_t *panel) {
 /* ========== Config Loading ========== */
 
 static char *trim(char *s) {
-    while (*s == ' ' || *s == '\t') s++;
+    while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') s++;
+    if (!*s) return s;  // Handle empty string
     char *e = s + strlen(s) - 1;
     while (e > s && (*e == '\n' || *e == '\r' || *e == ' ' || *e == '\t')) *e-- = '\0';
+    // Strip surrounding quotes (QSettings adds them for some values)
+    size_t len = strlen(s);
+    if (len >= 2 && s[0] == '"' && s[len-1] == '"') {
+        s[len-1] = '\0';
+        s++;
+    }
     return s;
 }
 
@@ -508,7 +634,7 @@ static void print_usage(const char *prog) {
     printf("ringlight-overlay - Screen ring light for Wayland\n\n");
     printf("Usage: %s [options]\n\n", prog);
     printf("Options:\n");
-    printf("  -s, --screen N|NAME  Screen index or name (default: 0)\n");
+    printf("  -s, --screen N|NAME  Screen index or name (default: first screen)\n");
     printf("  -w, --width N        Border width in pixels (default: 80)\n");
     printf("  -c, --color RRGGBB   Color in hex (default: FFFFFF)\n");
     printf("  -b, --brightness N   Brightness 1-100 (default: 100)\n");
@@ -516,7 +642,7 @@ static void print_usage(const char *prog) {
     printf("  -l, --list           List available screens and exit\n");
     printf("  -v, --verbose        Verbose output\n");
     printf("  -h, --help           Show this help\n");
-    printf("\nPress Ctrl+C to exit.\n");
+    printf("\nClick on the overlay or press Ctrl+C to exit.\n");
 }
 
 int main(int argc, char *argv[]) {
@@ -541,7 +667,6 @@ int main(int argc, char *argv[]) {
         switch (opt) {
         case 's':
             strncpy(cfg_target_name, optarg, sizeof(cfg_target_name) - 1);
-            cfg_target_output = atoi(optarg);
             break;
         case 'w':
             cfg_border_width = atoi(optarg);
@@ -590,6 +715,9 @@ int main(int argc, char *argv[]) {
     /* Wait for output info to arrive */
     wl_display_roundtrip(wl_display);
     
+    /* Another roundtrip to ensure all output names are received */
+    wl_display_roundtrip(wl_display);
+    
     /* Check required interfaces */
     if (!wl_compositor) {
         ERR("Compositor doesn't support wl_compositor\n");
@@ -624,44 +752,59 @@ int main(int argc, char *argv[]) {
     }
     
     /* Find target output */
-    output_t *target = &outputs[0];
+    output_t *target = NULL;
     
     if (cfg_target_name[0]) {
-        /* Try matching by name first */
+        /* First try to match by exact name */
         for (int i = 0; i < num_outputs; i++) {
             if (strcmp(outputs[i].name, cfg_target_name) == 0) {
                 target = &outputs[i];
+                LOG("Matched output by name: %s\n", outputs[i].name);
                 break;
             }
         }
-        /* Then try as index */
-        if (cfg_target_output >= 0 && cfg_target_output < num_outputs) {
-            target = &outputs[cfg_target_output];
+        
+        /* If no name match, try as numeric index */
+        if (!target) {
+            char *endptr;
+            long idx = strtol(cfg_target_name, &endptr, 10);
+            if (*endptr == '\0' && idx >= 0 && idx < num_outputs) {
+                target = &outputs[idx];
+                LOG("Matched output by index: %ld -> %s\n", idx, target->name);
+            }
         }
+        
+        if (!target) {
+            ERR("Screen '%s' not found. Use -l to list available screens.\n", cfg_target_name);
+            wl_display_disconnect(wl_display);
+            return 1;
+        }
+    } else {
+        /* No target specified - use first output */
+        target = &outputs[0];
+        LOG("Using default output: %s\n", target->name);
     }
     
     printf("%s on %s (%dx%d @ %d,%d)\n",
            cfg_fullscreen ? "Fullscreen" : "Ring",
            target->name, target->width, target->height,
            target->x, target->y);
+    printf("Click on the overlay to close.\n");
     
     /* Create panels */
-    uint32_t screen_w = target->width;
-    uint32_t screen_h = target->height;
-    
     if (cfg_fullscreen) {
         uint32_t anchor = ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
                          ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM |
                          ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
                          ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT;
-        panels[num_panels++] = create_panel(target, anchor, 0, 0);  /* 0,0 = fill anchored area */
+        panels[num_panels++] = create_panel(target, anchor, 0, 0);
     } else {
         /* Top */
         panels[num_panels++] = create_panel(target,
             ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
             ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
             ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT,
-            0, cfg_border_width);  /* 0 width = fill horizontal */
+            0, cfg_border_width);
         
         /* Bottom */
         panels[num_panels++] = create_panel(target,
@@ -675,7 +818,7 @@ int main(int argc, char *argv[]) {
             ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
             ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
             ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM,
-            cfg_border_width, 0);  /* 0 height = fill vertical */
+            cfg_border_width, 0);
         
         /* Right */
         panels[num_panels++] = create_panel(target,
@@ -734,6 +877,8 @@ int main(int argc, char *argv[]) {
         destroy_panel(panels[i]);
     }
     
+    if (wl_pointer) wl_pointer_destroy(wl_pointer);
+    if (wl_seat) wl_seat_destroy(wl_seat);
     if (layer_shell) zwlr_layer_shell_v1_destroy(layer_shell);
     if (wl_shm) wl_shm_destroy(wl_shm);
     if (wl_compositor) wl_compositor_destroy(wl_compositor);

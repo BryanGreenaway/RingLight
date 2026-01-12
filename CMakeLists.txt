@@ -16,7 +16,6 @@ find_program(WAYLAND_SCANNER wayland-scanner REQUIRED)
 # Find wayland-protocols directory
 pkg_get_variable(WAYLAND_PROTOCOLS_DIR wayland-protocols pkgdatadir)
 if(NOT WAYLAND_PROTOCOLS_DIR)
-    # Fallback paths
     if(EXISTS "/usr/share/wayland-protocols")
         set(WAYLAND_PROTOCOLS_DIR "/usr/share/wayland-protocols")
     else()
@@ -24,12 +23,12 @@ if(NOT WAYLAND_PROTOCOLS_DIR)
     endif()
 endif()
 
-# Generate layer-shell protocol code
+# Generate protocol code
 set(PROTOCOL_DIR ${CMAKE_SOURCE_DIR}/protocol)
 set(GENERATED_DIR ${CMAKE_BINARY_DIR}/generated)
 file(MAKE_DIRECTORY ${GENERATED_DIR})
 
-# XDG Shell (required by layer-shell)
+# XDG Shell (required by layer-shell for xdg_popup reference)
 set(XDG_SHELL_XML ${WAYLAND_PROTOCOLS_DIR}/stable/xdg-shell/xdg-shell.xml)
 set(XDG_SHELL_CLIENT_H ${GENERATED_DIR}/xdg-shell-client.h)
 set(XDG_SHELL_CODE_C ${GENERATED_DIR}/xdg-shell-code.c)
@@ -63,7 +62,7 @@ add_custom_command(
 add_custom_command(
     OUTPUT ${LAYER_SHELL_CODE_C}
     COMMAND ${WAYLAND_SCANNER} private-code ${LAYER_SHELL_XML} ${LAYER_SHELL_CODE_C}
-    DEPENDS ${LAYER_SHELL_XML}
+    DEPENDS ${LAYER_SHELL_XML} ${XDG_SHELL_CLIENT_H}
     COMMENT "Generating layer-shell protocol code"
 )
 
@@ -72,7 +71,7 @@ add_custom_target(wayland_protocols DEPENDS
     ${LAYER_SHELL_CLIENT_H} ${LAYER_SHELL_CODE_C}
 )
 
-# === Overlay (pure C, no Qt window management) ===
+# === Overlay (pure C, no Qt) ===
 add_executable(ringlight-overlay 
     src/overlay.c 
     ${XDG_SHELL_CODE_C}
@@ -85,7 +84,7 @@ target_include_directories(ringlight-overlay PRIVATE
 )
 target_link_libraries(ringlight-overlay PRIVATE
     ${WAYLAND_CLIENT_LIBRARIES}
-    rt  # for shm_open
+    rt
 )
 target_compile_options(ringlight-overlay PRIVATE ${WAYLAND_CLIENT_CFLAGS_OTHER})
 

@@ -111,22 +111,22 @@ private:
             baseArgs << "-f";
         }
         
-        // Get enabled screen indices
-        QStringList screenIndices;
+        // Get enabled screens - use screen NAME for reliable targeting
+        QStringList screenNames;
         for (int i = 0; i < m_screenList->count(); ++i) {
             auto *item = m_screenList->item(i);
             if (item->checkState() == Qt::Checked)
-                screenIndices << QString::number(item->data(Qt::UserRole + 1).toInt());
+                screenNames << item->data(Qt::UserRole).toString();  // Use name, not index
         }
         
         // If no screens selected, use screen 0
-        if (screenIndices.isEmpty()) screenIndices << "0";
+        if (screenNames.isEmpty()) screenNames << "0";
         
         // Spawn ONE process per screen
-        for (const QString &idx : screenIndices) {
+        for (const QString &name : screenNames) {
             QProcess *proc = new QProcess(this);
             QStringList args = baseArgs;
-            args << "-s" << idx;
+            args << "-s" << name;
             proc->start("ringlight-overlay", args);
             m_overlays << proc;
         }
@@ -238,9 +238,13 @@ private:
         
         QStringList enabled = s.value("enabledScreens", "").toString().split(',', Qt::SkipEmptyParts);
         QTimer::singleShot(100, this, [this, enabled]() {
-            for (int i = 0; i < m_screenList->count(); ++i) {
-                auto *item = m_screenList->item(i);
-                item->setCheckState(enabled.contains(item->data(Qt::UserRole).toString()) ? Qt::Checked : Qt::Unchecked);
+            // Only apply saved screen selection if there are saved screens
+            // Otherwise keep the defaults (screen 0 checked)
+            if (!enabled.isEmpty()) {
+                for (int i = 0; i < m_screenList->count(); ++i) {
+                    auto *item = m_screenList->item(i);
+                    item->setCheckState(enabled.contains(item->data(Qt::UserRole).toString()) ? Qt::Checked : Qt::Unchecked);
+                }
             }
             toggleAutoEnable(m_autoEnable->isChecked());
         });

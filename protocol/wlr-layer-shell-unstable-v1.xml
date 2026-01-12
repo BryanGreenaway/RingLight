@@ -25,7 +25,7 @@
     THIS SOFTWARE.
   </copyright>
 
-  <interface name="zwlr_layer_shell_v1" version="5">
+  <interface name="zwlr_layer_shell_v1" version="4">
     <description summary="create surfaces that are layers of the desktop">
       Clients can use this interface to assign the surface_layer role to
       wl_surfaces. Such surfaces are assigned to a "layer" of the output and
@@ -76,6 +76,7 @@
         Multiple surfaces can share a single layer, and ordering within a
         single layer is undefined.
       </description>
+
       <entry name="background" value="0"/>
       <entry name="bottom" value="1"/>
       <entry name="top" value="2"/>
@@ -89,7 +90,7 @@
     </event>
   </interface>
 
-  <interface name="zwlr_layer_surface_v1" version="5">
+  <interface name="zwlr_layer_surface_v1" version="4">
     <description summary="layer metadata interface">
       An interface that may be implemented by a wl_surface, for surfaces that
       are designed to be rendered as a layer of a stacked desktop-like
@@ -200,6 +201,7 @@
         desktop experience; (2) some applications will want to take exclusive
         keyboard focus.
       </description>
+
       <entry name="none" value="0">
         <description summary="no keyboard focus is possible">
           This value indicates that this surface is not interested in keyboard
@@ -207,7 +209,8 @@
 
           This is the default value, set for newly created layer shell surfaces.
 
-          This is useful for e.g. desktop combos or soft keyboards.
+          This is useful for e.g. desktop widgets that display information or
+          only have interaction with non-keyboard input devices.
         </description>
       </entry>
       <entry name="exclusive" value="1">
@@ -301,16 +304,6 @@
         A client may send multiple ack_configure requests before committing,
         but only the last request sent before a commit indicates which
         configure event the client really is responding to.
-
-        Sending an ack_configure request consumes the serial number sent with
-        the request, as well as serial numbers sent by any configure events
-        sent on this object prior to the configure event referenced by the
-        serial argument to the ack_configure. It is a client error to issue
-        multiple ack_configure requests referencing a serial from the same
-        configure event, or to issue an ack_configure request referencing a
-        serial from a configure event issued before the event identified by the
-        last ack_configure request sent on this object. Doing so will raise an
-        invalid_serial error.
       </description>
       <arg name="serial" type="uint" summary="the serial from the configure event"/>
     </request>
@@ -364,7 +357,6 @@
       <entry name="invalid_size" value="1" summary="size is invalid"/>
       <entry name="invalid_anchor" value="2" summary="anchor bitfield is invalid"/>
       <entry name="invalid_keyboard_interactivity" value="3" summary="keyboard interactivity is invalid"/>
-      <entry name="invalid_exclusive_edge" value="4" summary="exclusive edge is invalid given the surface anchors"/>
     </enum>
 
     <enum name="anchor" bitfield="true">
@@ -381,20 +373,6 @@
         Layer is double-buffered, see wl_surface.commit.
       </description>
       <arg name="layer" type="uint" enum="zwlr_layer_shell_v1.layer" summary="layer to move this surface to"/>
-    </request>
-
-    <request name="set_exclusive_edge" since="5">
-      <description summary="set the edge the exclusive zone will be applied to">
-        Requests an edge for the exclusive zone to apply. The exclusive
-        edge will be automatically deduced from anchor points when possible,
-        but when the surface is anchored to a corner, it will be necessary
-        to set it explicitly to disambiguate, as it is not possible to deduce
-        which one of the two corner edges should be used.
-
-        The edge must be one the surface is anchored to, otherwise the
-        invalid_exclusive_edge protocol error will be raised.
-      </description>
-      <arg name="edge" type="uint" summary="the edge for the exclusive zone"/>
     </request>
   </interface>
 </protocol>

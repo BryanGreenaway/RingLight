@@ -8,9 +8,9 @@ Screen ring light for KDE Plasma 6 / Wayland. Creates bright borders around your
 - **Fullscreen mode** - turn your entire monitor into a light source
 - Layer-shell overlay (stays above fullscreen apps)
 - **True multi-monitor support** - each screen can have its own overlay
+- **Click to close** - click anywhere on the overlay to dismiss it
 - GUI with system tray integration
 - Automatic activation on webcam use
-- Settings persist between sessions
 
 ## Building
 
@@ -31,16 +31,6 @@ On Arch Linux:
 sudo pacman -S qt6-base wayland wayland-protocols cmake
 ```
 
-On Fedora:
-```bash
-sudo dnf install qt6-qtbase-devel wayland-devel wayland-protocols-devel cmake
-```
-
-On Ubuntu/Debian:
-```bash
-sudo apt install qt6-base-dev libwayland-dev wayland-protocols cmake pkg-config
-```
-
 ## Usage
 
 ```bash
@@ -48,67 +38,52 @@ sudo apt install qt6-base-dev libwayland-dev wayland-protocols cmake pkg-config
 ringlight-gui
 
 # Single screen overlay
-ringlight-overlay              # Default screen, uses saved settings
-ringlight-overlay -s 0         # Screen 0
-ringlight-overlay -s DP-1      # By name
-
-# Fullscreen mode (whole screen lights up)
-ringlight-overlay -f
-ringlight-overlay -f -s 1      # Fullscreen on screen 1
+ringlight-overlay              # Default screen
+ringlight-overlay -s 0         # Screen 0 (by index)
+ringlight-overlay -s DP-1      # Screen by name (recommended)
 
 # Multi-monitor: spawn separate processes
-ringlight-overlay -s 0 &
-ringlight-overlay -s 1 &
+ringlight-overlay -s HDMI-A-1 &
+ringlight-overlay -s DP-1 &
 
-# With options
-ringlight-overlay -s 0 -c FF9900 -b 80 -w 100
+# Fullscreen mode
+ringlight-overlay -f -s DP-1
 
-# Monitor daemon (auto-enable on webcam)
-ringlight-monitor -v
+# List available screens
+ringlight-overlay -l
 ```
 
 ## Options
 
 | Flag | Description |
 |------|-------------|
-| `-s N` | Screen index or name |
-| `-w N` | Border width in pixels (default: 80, or from config) |
-| `-c HEX` | Color as RRGGBB (default: FFFFFF, or from config) |
-| `-b N` | Brightness 1-100 (default: 100, or from config) |
-| `-f` | Fullscreen mode (entire screen lights up) |
-| `-l` | List available screens with wl_output info |
+| `-s N\|NAME` | Screen index or name (use name for reliability) |
+| `-w N` | Border width in pixels (default: 80) |
+| `-c HEX` | Color as RRGGBB (default: FFFFFF) |
+| `-b N` | Brightness 1-100 (default: 100) |
+| `-f` | Fullscreen mode |
+| `-l` | List available screens |
+| `-v` | Verbose output |
 
-## How Multi-Monitor Works
+## How to Close
 
-This version uses the wlr-layer-shell Wayland protocol directly with pure C (no Qt for the overlay). When you run `ringlight-overlay -s 1`, it:
+- **Click** anywhere on the ring light overlay
+- Press **Ctrl+C** in the terminal
+- Use the GUI's "Turn Off" button
+- Run `pkill ringlight-overlay`
 
-1. Connects directly to Wayland and enumerates all outputs
-2. Creates `wl_surface` objects manually (no Qt window management)
-3. Passes the specific `wl_output` to `zwlr_layer_shell_v1_get_layer_surface()`
-4. Uses shared memory buffers for rendering solid colors
+## Multi-Monitor Notes
 
-This avoids the conflict where Qt assigns `xdg_toplevel` role to windows before we can assign `layer_surface` role.
+Use screen **names** (like `DP-1`, `HDMI-A-1`) rather than indices for reliable targeting. Screen indices can change between reboots.
 
-The GUI and monitor daemon spawn separate overlay processes for each selected screen.
+```bash
+# Find your screen names
+ringlight-overlay -l
 
-## Config File
-
-Settings are saved to `~/.config/ringlight/config.ini` and are automatically loaded by both the overlay and monitor daemon.
-
-## Troubleshooting
-
-**Overlay only appears on one screen:**
-- Run `ringlight-overlay -l` to verify screens are detected
-- Make sure you're spawning separate processes: `ringlight-overlay -s 0 & ringlight-overlay -s 1 &`
-
-**"Compositor doesn't support wlr-layer-shell":**
-- KDE Plasma 5.20+ supports this protocol
-- Other compatible compositors: Sway, Hyprland, wlroots-based compositors
-
-**To close the overlay:**
-- Press Ctrl+C in the terminal, or
-- Kill the process: `pkill ringlight-overlay`
-- The GUI's "Turn Off" button also stops overlays
+# Target specific screens by name
+ringlight-overlay -s DP-1 &
+ringlight-overlay -s HDMI-A-1 &
+```
 
 ## License
 
