@@ -15,6 +15,7 @@
 #include <signal.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <errno.h>
 #include <getopt.h>
 #include <limits.h>
@@ -29,7 +30,7 @@
 
 static int cfg_border_width = 80;
 static int cfg_brightness = 100;
-static uint32_t cfg_color = 0xFFFFFF;  // RGB
+static uint32_t cfg_color = 0xFFFFFF;
 static bool cfg_fullscreen = false;
 static char cfg_target_name[64] = "";
 static bool cfg_list_only = false;
@@ -37,13 +38,13 @@ static bool cfg_verbose = false;
 
 /* ========== Wayland State ========== */
 
-static struct wl_display *wl_display = NULL;
-static struct wl_registry *wl_registry = NULL;
-static struct wl_compositor *wl_compositor = NULL;
-static struct wl_shm *wl_shm = NULL;
-static struct wl_seat *wl_seat = NULL;
-static struct wl_pointer *wl_pointer = NULL;
-static struct zwlr_layer_shell_v1 *layer_shell = NULL;
+static struct wl_display *wl_display;
+static struct wl_registry *wl_registry;
+static struct wl_compositor *wl_compositor;
+static struct wl_shm *wl_shm;
+static struct wl_seat *wl_seat;
+static struct wl_pointer *wl_pointer;
+static struct zwlr_layer_shell_v1 *layer_shell;
 
 static volatile sig_atomic_t running = 1;
 
@@ -53,12 +54,9 @@ static volatile sig_atomic_t running = 1;
 
 typedef struct {
     struct wl_output *wl_output;
-    uint32_t global_name;
     char name[64];
-    int32_t width;
-    int32_t height;
-    int32_t x;
-    int32_t y;
+    int32_t width, height;
+    int32_t x, y;
     int32_t scale;
     bool done;
 } output_t;
@@ -74,50 +72,34 @@ typedef struct {
     struct wl_buffer *buffer;
     void *buffer_data;
     size_t buffer_size;
-    uint32_t width;
-    uint32_t height;
-    uint32_t anchor;
+    uint32_t width, height;
     bool configured;
-    bool closed;
 } panel_t;
 
 #define MAX_PANELS 5
 static panel_t *panels[MAX_PANELS];
 static int num_panels = 0;
-
-/* Track which surface the pointer is over */
-static struct wl_surface *pointer_surface = NULL;
+static struct wl_surface *pointer_surface;
 
 /* ========== Helpers ========== */
 
 #define LOG(...) do { if (cfg_verbose) fprintf(stderr, "[ringlight] " __VA_ARGS__); } while(0)
 #define ERR(...) fprintf(stderr, "[ringlight] ERROR: " __VA_ARGS__)
 
-static void sig_handler(int sig) {
-    (void)sig;
-    running = 0;
-}
+static void sig_handler(int sig) { (void)sig; running = 0; }
 
-/* Create anonymous shared memory file */
 static int create_shm_file(size_t size) {
     int fd = -1;
     
-    /* Try memfd_create first (Linux 3.17+) */
 #ifdef __NR_memfd_create
-    fd = syscall(__NR_memfd_create, "ringlight-buffer", 0);
+    fd = syscall(__NR_memfd_create, "ringlight", 0);
 #endif
     
-    /* Fallback to shm_open */
     if (fd < 0) {
         char name[64];
-        struct timespec ts;
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        snprintf(name, sizeof(name), "/ringlight-%d-%ld", getpid(), ts.tv_nsec);
-        
+        snprintf(name, sizeof(name), "/ringlight-%d-%ld", getpid(), (long)time(NULL));
         fd = shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
-        if (fd >= 0) {
-            shm_unlink(name);
-        }
+        if (fd >= 0) shm_unlink(name);
     }
     
     if (fd < 0) {
@@ -134,7 +116,6 @@ static int create_shm_file(size_t size) {
     return fd;
 }
 
-/* Create a buffer filled with solid color */
 static bool create_panel_buffer(panel_t *panel) {
     if (panel->width == 0 || panel->height == 0) {
         ERR("Invalid panel dimensions: %ux%u\n", panel->width, panel->height);
@@ -154,130 +135,84 @@ static bool create_panel_buffer(panel_t *panel) {
         return false;
     }
     
-    /* Fill with color (ARGB8888 format) */
+    /* Fill with color (ARGB8888) */
     uint32_t r = ((cfg_color >> 16) & 0xFF) * cfg_brightness / 100;
     uint32_t g = ((cfg_color >> 8) & 0xFF) * cfg_brightness / 100;
     uint32_t b = (cfg_color & 0xFF) * cfg_brightness / 100;
-    uint32_t pixel = (0xFF << 24) | (r << 16) | (g << 8) | b;
+    uint32_t pixel = (0xFFu << 24) | (r << 16) | (g << 8) | b;
     
     uint32_t *pixels = data;
-    for (size_t i = 0; i < panel->width * panel->height; i++) {
-        pixels[i] = pixel;
-    }
+    size_t count = panel->width * panel->height;
+    for (size_t i = 0; i < count; i++) pixels[i] = pixel;
     
     struct wl_shm_pool *pool = wl_shm_create_pool(wl_shm, fd, size);
+    close(fd);
+    
     if (!pool) {
         ERR("Failed to create shm pool\n");
         munmap(data, size);
-        close(fd);
         return false;
     }
     
-    struct wl_buffer *buffer = wl_shm_pool_create_buffer(
-        pool, 0, panel->width, panel->height, stride, WL_SHM_FORMAT_ARGB8888);
+    panel->buffer = wl_shm_pool_create_buffer(pool, 0, panel->width, panel->height, stride, WL_SHM_FORMAT_ARGB8888);
     wl_shm_pool_destroy(pool);
-    close(fd);
     
-    if (!buffer) {
+    if (!panel->buffer) {
         ERR("Failed to create wl_buffer\n");
         munmap(data, size);
         return false;
     }
     
-    panel->buffer = buffer;
     panel->buffer_data = data;
     panel->buffer_size = size;
-    
-    LOG("Created buffer %ux%u (%zu bytes)\n", panel->width, panel->height, size);
+    LOG("Created buffer %ux%u\n", panel->width, panel->height);
     return true;
 }
 
 static void destroy_panel_buffer(panel_t *panel) {
-    if (panel->buffer) {
-        wl_buffer_destroy(panel->buffer);
-        panel->buffer = NULL;
-    }
-    if (panel->buffer_data) {
-        munmap(panel->buffer_data, panel->buffer_size);
-        panel->buffer_data = NULL;
-        panel->buffer_size = 0;
-    }
+    if (panel->buffer) { wl_buffer_destroy(panel->buffer); panel->buffer = NULL; }
+    if (panel->buffer_data) { munmap(panel->buffer_data, panel->buffer_size); panel->buffer_data = NULL; }
 }
 
-/* ========== Pointer (Mouse) Callbacks ========== */
+/* ========== Pointer Callbacks ========== */
 
-static void pointer_enter(void *data, struct wl_pointer *pointer,
-                         uint32_t serial, struct wl_surface *surface,
-                         wl_fixed_t sx, wl_fixed_t sy) {
-    (void)data; (void)pointer; (void)serial; (void)sx; (void)sy;
+static void pointer_enter(void *data, struct wl_pointer *p, uint32_t serial,
+                         struct wl_surface *surface, wl_fixed_t sx, wl_fixed_t sy) {
+    (void)data; (void)p; (void)serial; (void)sx; (void)sy;
     pointer_surface = surface;
-    LOG("Pointer entered surface %p\n", (void*)surface);
 }
 
-static void pointer_leave(void *data, struct wl_pointer *pointer,
-                         uint32_t serial, struct wl_surface *surface) {
-    (void)data; (void)pointer; (void)serial; (void)surface;
+static void pointer_leave(void *data, struct wl_pointer *p, uint32_t serial, struct wl_surface *surface) {
+    (void)data; (void)p; (void)serial; (void)surface;
     pointer_surface = NULL;
-    LOG("Pointer left surface\n");
 }
 
-static void pointer_motion(void *data, struct wl_pointer *pointer,
-                          uint32_t time, wl_fixed_t sx, wl_fixed_t sy) {
-    (void)data; (void)pointer; (void)time; (void)sx; (void)sy;
-    /* We don't need motion tracking */
-}
-
-static void pointer_button(void *data, struct wl_pointer *pointer,
-                          uint32_t serial, uint32_t time, uint32_t button,
-                          uint32_t state) {
-    (void)data; (void)pointer; (void)serial; (void)time; (void)button;
+static void pointer_button(void *data, struct wl_pointer *p, uint32_t serial,
+                          uint32_t time, uint32_t button, uint32_t state) {
+    (void)data; (void)p; (void)serial; (void)time; (void)button;
+    if (state != WL_POINTER_BUTTON_STATE_PRESSED) return;
     
-    /* Check if button was pressed (not released) */
-    if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
-        /* Check if pointer is over one of our surfaces */
-        for (int i = 0; i < num_panels; i++) {
-            if (panels[i] && panels[i]->wl_surface == pointer_surface) {
-                LOG("Click detected on panel %d - quitting\n", i);
-                running = 0;
-                return;
-            }
+    for (int i = 0; i < num_panels; i++) {
+        if (panels[i] && panels[i]->wl_surface == pointer_surface) {
+            LOG("Click on panel %d - quitting\n", i);
+            running = 0;
+            return;
         }
     }
 }
 
-static void pointer_axis(void *data, struct wl_pointer *pointer,
-                        uint32_t time, uint32_t axis, wl_fixed_t value) {
-    (void)data; (void)pointer; (void)time; (void)axis; (void)value;
-}
-
-static void pointer_frame(void *data, struct wl_pointer *pointer) {
-    (void)data; (void)pointer;
-}
-
-static void pointer_axis_source(void *data, struct wl_pointer *pointer,
-                               uint32_t axis_source) {
-    (void)data; (void)pointer; (void)axis_source;
-}
-
-static void pointer_axis_stop(void *data, struct wl_pointer *pointer,
-                             uint32_t time, uint32_t axis) {
-    (void)data; (void)pointer; (void)time; (void)axis;
-}
-
-static void pointer_axis_discrete(void *data, struct wl_pointer *pointer,
-                                 uint32_t axis, int32_t discrete) {
-    (void)data; (void)pointer; (void)axis; (void)discrete;
-}
+/* Unused but required by listener */
+static void pointer_motion(void *d, struct wl_pointer *p, uint32_t t, wl_fixed_t x, wl_fixed_t y) { (void)d; (void)p; (void)t; (void)x; (void)y; }
+static void pointer_axis(void *d, struct wl_pointer *p, uint32_t t, uint32_t a, wl_fixed_t v) { (void)d; (void)p; (void)t; (void)a; (void)v; }
+static void pointer_frame(void *d, struct wl_pointer *p) { (void)d; (void)p; }
+static void pointer_axis_source(void *d, struct wl_pointer *p, uint32_t s) { (void)d; (void)p; (void)s; }
+static void pointer_axis_stop(void *d, struct wl_pointer *p, uint32_t t, uint32_t a) { (void)d; (void)p; (void)t; (void)a; }
+static void pointer_axis_discrete(void *d, struct wl_pointer *p, uint32_t a, int32_t v) { (void)d; (void)p; (void)a; (void)v; }
 
 static const struct wl_pointer_listener pointer_listener = {
-    .enter = pointer_enter,
-    .leave = pointer_leave,
-    .motion = pointer_motion,
-    .button = pointer_button,
-    .axis = pointer_axis,
-    .frame = pointer_frame,
-    .axis_source = pointer_axis_source,
-    .axis_stop = pointer_axis_stop,
+    .enter = pointer_enter, .leave = pointer_leave, .motion = pointer_motion,
+    .button = pointer_button, .axis = pointer_axis, .frame = pointer_frame,
+    .axis_source = pointer_axis_source, .axis_stop = pointer_axis_stop,
     .axis_discrete = pointer_axis_discrete,
 };
 
@@ -285,21 +220,16 @@ static const struct wl_pointer_listener pointer_listener = {
 
 static void seat_capabilities(void *data, struct wl_seat *seat, uint32_t caps) {
     (void)data;
-    
     if ((caps & WL_SEAT_CAPABILITY_POINTER) && !wl_pointer) {
         wl_pointer = wl_seat_get_pointer(seat);
         wl_pointer_add_listener(wl_pointer, &pointer_listener, NULL);
-        LOG("Pointer capability detected, listener added\n");
     } else if (!(caps & WL_SEAT_CAPABILITY_POINTER) && wl_pointer) {
         wl_pointer_destroy(wl_pointer);
         wl_pointer = NULL;
     }
 }
 
-static void seat_name(void *data, struct wl_seat *seat, const char *name) {
-    (void)data; (void)seat;
-    LOG("Seat name: %s\n", name);
-}
+static void seat_name(void *d, struct wl_seat *s, const char *n) { (void)d; (void)s; (void)n; }
 
 static const struct wl_seat_listener seat_listener = {
     .capabilities = seat_capabilities,
@@ -308,261 +238,162 @@ static const struct wl_seat_listener seat_listener = {
 
 /* ========== Layer Surface Callbacks ========== */
 
-static void layer_surface_configure(void *data, struct zwlr_layer_surface_v1 *surface,
-                                    uint32_t serial, uint32_t width, uint32_t height) {
+static void layer_configure(void *data, struct zwlr_layer_surface_v1 *surface,
+                           uint32_t serial, uint32_t width, uint32_t height) {
     panel_t *panel = data;
     
-    LOG("Configure: serial=%u size=%ux%u\n", serial, width, height);
-    
-    /* Acknowledge the configure */
     zwlr_layer_surface_v1_ack_configure(surface, serial);
     
-    /* Update size if compositor provided one */
     if (width > 0) panel->width = width;
     if (height > 0) panel->height = height;
     
-    /* Recreate buffer if needed */
-    if (!panel->buffer || 
-        (width > 0 && height > 0 && 
-         (panel->width != width || panel->height != height))) {
-        destroy_panel_buffer(panel);
-        if (!create_panel_buffer(panel)) {
-            ERR("Failed to create buffer in configure\n");
-            running = 0;
-            return;
-        }
+    destroy_panel_buffer(panel);
+    if (!create_panel_buffer(panel)) {
+        running = 0;
+        return;
     }
     
-    /* Attach and commit */
     wl_surface_attach(panel->wl_surface, panel->buffer, 0, 0);
     wl_surface_damage_buffer(panel->wl_surface, 0, 0, panel->width, panel->height);
     wl_surface_commit(panel->wl_surface);
-    
     panel->configured = true;
-    LOG("Panel configured and committed\n");
 }
 
-static void layer_surface_closed(void *data, struct zwlr_layer_surface_v1 *surface) {
-    panel_t *panel = data;
+static void layer_closed(void *data, struct zwlr_layer_surface_v1 *surface) {
     (void)surface;
-    LOG("Layer surface closed\n");
-    panel->closed = true;
+    ((panel_t *)data)->configured = false;
     running = 0;
 }
 
-static const struct zwlr_layer_surface_v1_listener layer_surface_listener = {
-    .configure = layer_surface_configure,
-    .closed = layer_surface_closed,
+static const struct zwlr_layer_surface_v1_listener layer_listener = {
+    .configure = layer_configure,
+    .closed = layer_closed,
 };
 
 /* ========== Output Callbacks ========== */
 
-static output_t *find_output_by_wl(struct wl_output *wl_output) {
-    for (int i = 0; i < num_outputs; i++) {
-        if (outputs[i].wl_output == wl_output) return &outputs[i];
-    }
+static output_t *find_output(struct wl_output *wl) {
+    for (int i = 0; i < num_outputs; i++)
+        if (outputs[i].wl_output == wl) return &outputs[i];
     return NULL;
 }
 
-static void output_geometry(void *data, struct wl_output *wl_output,
-                           int32_t x, int32_t y, int32_t phys_w, int32_t phys_h,
-                           int32_t subpixel, const char *make, const char *model,
-                           int32_t transform) {
-    (void)data; (void)phys_w; (void)phys_h; (void)subpixel; 
-    (void)make; (void)model; (void)transform;
-    
-    output_t *output = find_output_by_wl(wl_output);
-    if (output) {
-        output->x = x;
-        output->y = y;
-    }
+static void output_geometry(void *d, struct wl_output *o, int32_t x, int32_t y,
+                           int32_t pw, int32_t ph, int32_t sp, const char *mk,
+                           const char *md, int32_t tr) {
+    (void)d; (void)pw; (void)ph; (void)sp; (void)mk; (void)md; (void)tr;
+    output_t *out = find_output(o);
+    if (out) { out->x = x; out->y = y; }
 }
 
-static void output_mode(void *data, struct wl_output *wl_output,
-                        uint32_t flags, int32_t width, int32_t height, int32_t refresh) {
-    (void)data; (void)refresh;
-    
+static void output_mode(void *d, struct wl_output *o, uint32_t flags, int32_t w, int32_t h, int32_t r) {
+    (void)d; (void)r;
     if (!(flags & WL_OUTPUT_MODE_CURRENT)) return;
-    
-    output_t *output = find_output_by_wl(wl_output);
-    if (output) {
-        output->width = width;
-        output->height = height;
-    }
+    output_t *out = find_output(o);
+    if (out) { out->width = w; out->height = h; }
 }
 
-static void output_done(void *data, struct wl_output *wl_output) {
-    (void)data;
-    output_t *output = find_output_by_wl(wl_output);
-    if (output) {
-        output->done = true;
-        LOG("Output %d done: %s %dx%d @ %d,%d\n", 
-            (int)(output - outputs), output->name, 
-            output->width, output->height, output->x, output->y);
-    }
+static void output_done(void *d, struct wl_output *o) {
+    (void)d;
+    output_t *out = find_output(o);
+    if (out) out->done = true;
 }
 
-static void output_scale(void *data, struct wl_output *wl_output, int32_t factor) {
-    (void)data;
-    output_t *output = find_output_by_wl(wl_output);
-    if (output) output->scale = factor;
+static void output_scale(void *d, struct wl_output *o, int32_t f) {
+    (void)d;
+    output_t *out = find_output(o);
+    if (out) out->scale = f;
 }
 
-static void output_name(void *data, struct wl_output *wl_output, const char *name) {
-    (void)data;
-    output_t *output = find_output_by_wl(wl_output);
-    if (output && name) {
-        strncpy(output->name, name, sizeof(output->name) - 1);
-        LOG("Output name received: %s\n", name);
-    }
+static void output_name(void *d, struct wl_output *o, const char *name) {
+    (void)d;
+    output_t *out = find_output(o);
+    if (out && name) strncpy(out->name, name, sizeof(out->name) - 1);
 }
 
-static void output_description(void *data, struct wl_output *wl_output, const char *desc) {
-    (void)data; (void)wl_output; (void)desc;
-}
+static void output_desc(void *d, struct wl_output *o, const char *desc) { (void)d; (void)o; (void)desc; }
 
 static const struct wl_output_listener output_listener = {
-    .geometry = output_geometry,
-    .mode = output_mode,
-    .done = output_done,
-    .scale = output_scale,
-    .name = output_name,
-    .description = output_description,
+    .geometry = output_geometry, .mode = output_mode, .done = output_done,
+    .scale = output_scale, .name = output_name, .description = output_desc,
 };
 
 /* ========== Registry Callbacks ========== */
 
-static void registry_global(void *data, struct wl_registry *registry,
-                           uint32_t name, const char *interface, uint32_t version) {
+static void registry_global(void *data, struct wl_registry *reg, uint32_t name,
+                           const char *iface, uint32_t ver) {
     (void)data;
     
-    LOG("Registry: %s v%u (name=%u)\n", interface, version, name);
-    
-    if (strcmp(interface, wl_compositor_interface.name) == 0) {
-        wl_compositor = wl_registry_bind(registry, name, &wl_compositor_interface, 4);
-    } 
-    else if (strcmp(interface, wl_shm_interface.name) == 0) {
-        wl_shm = wl_registry_bind(registry, name, &wl_shm_interface, 1);
-    }
-    else if (strcmp(interface, wl_seat_interface.name) == 0) {
-        wl_seat = wl_registry_bind(registry, name, &wl_seat_interface, 
-                                   version < 5 ? version : 5);
+    if (strcmp(iface, wl_compositor_interface.name) == 0) {
+        wl_compositor = wl_registry_bind(reg, name, &wl_compositor_interface, 4);
+    } else if (strcmp(iface, wl_shm_interface.name) == 0) {
+        wl_shm = wl_registry_bind(reg, name, &wl_shm_interface, 1);
+    } else if (strcmp(iface, wl_seat_interface.name) == 0) {
+        wl_seat = wl_registry_bind(reg, name, &wl_seat_interface, ver < 5 ? ver : 5);
         wl_seat_add_listener(wl_seat, &seat_listener, NULL);
-        LOG("Seat bound, listener added\n");
-    }
-    else if (strcmp(interface, wl_output_interface.name) == 0) {
+    } else if (strcmp(iface, wl_output_interface.name) == 0) {
         if (num_outputs < MAX_OUTPUTS) {
-            output_t *output = &outputs[num_outputs++];
-            memset(output, 0, sizeof(*output));
-            output->global_name = name;
-            output->scale = 1;
-            snprintf(output->name, sizeof(output->name), "output-%d", num_outputs - 1);
-            
-            /* Bind to at least version 4 for output name support */
-            uint32_t bind_version = version < 4 ? version : 4;
-            output->wl_output = wl_registry_bind(registry, name, 
-                                                  &wl_output_interface, bind_version);
-            wl_output_add_listener(output->wl_output, &output_listener, NULL);
+            output_t *out = &outputs[num_outputs++];
+            memset(out, 0, sizeof(*out));
+            out->scale = 1;
+            snprintf(out->name, sizeof(out->name), "output-%d", num_outputs - 1);
+            out->wl_output = wl_registry_bind(reg, name, &wl_output_interface, ver < 4 ? ver : 4);
+            wl_output_add_listener(out->wl_output, &output_listener, NULL);
         }
-    } 
-    else if (strcmp(interface, zwlr_layer_shell_v1_interface.name) == 0) {
-        layer_shell = wl_registry_bind(registry, name, 
-                                       &zwlr_layer_shell_v1_interface, 
-                                       version < 4 ? version : 4);
+    } else if (strcmp(iface, zwlr_layer_shell_v1_interface.name) == 0) {
+        layer_shell = wl_registry_bind(reg, name, &zwlr_layer_shell_v1_interface, ver < 4 ? ver : 4);
     }
 }
 
-static void registry_global_remove(void *data, struct wl_registry *registry, uint32_t name) {
-    (void)data; (void)registry; (void)name;
-}
+static void registry_remove(void *d, struct wl_registry *r, uint32_t n) { (void)d; (void)r; (void)n; }
 
 static const struct wl_registry_listener registry_listener = {
     .global = registry_global,
-    .global_remove = registry_global_remove,
+    .global_remove = registry_remove,
 };
 
 /* ========== Panel Creation ========== */
 
-static panel_t *create_panel(output_t *output, uint32_t anchor, uint32_t width, uint32_t height) {
+static panel_t *create_panel(output_t *output, uint32_t anchor, uint32_t w, uint32_t h) {
     panel_t *panel = calloc(1, sizeof(panel_t));
     if (!panel) return NULL;
     
-    panel->anchor = anchor;
-    panel->width = width;
-    panel->height = height;
+    panel->width = w;
+    panel->height = h;
     
-    /* Create surface */
     panel->wl_surface = wl_compositor_create_surface(wl_compositor);
-    if (!panel->wl_surface) {
-        ERR("Failed to create wl_surface\n");
-        free(panel);
-        return NULL;
-    }
-    
-    /* Create layer surface - PASS THE SPECIFIC OUTPUT */
-    LOG("Creating layer surface on output: %s (wl_output=%p)\n", 
-        output ? output->name : "NULL", output ? (void*)output->wl_output : NULL);
+    if (!panel->wl_surface) { free(panel); return NULL; }
     
     panel->layer_surface = zwlr_layer_shell_v1_get_layer_surface(
-        layer_shell,
-        panel->wl_surface,
-        output ? output->wl_output : NULL,
-        ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY,
-        "ringlight"
-    );
+        layer_shell, panel->wl_surface, output ? output->wl_output : NULL,
+        ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY, "ringlight");
     
     if (!panel->layer_surface) {
-        ERR("Failed to create layer surface\n");
         wl_surface_destroy(panel->wl_surface);
         free(panel);
         return NULL;
     }
     
-    /* Configure layer surface */
-    zwlr_layer_surface_v1_add_listener(panel->layer_surface, &layer_surface_listener, panel);
-    zwlr_layer_surface_v1_set_size(panel->layer_surface, width, height);
+    zwlr_layer_surface_v1_add_listener(panel->layer_surface, &layer_listener, panel);
+    zwlr_layer_surface_v1_set_size(panel->layer_surface, w, h);
     zwlr_layer_surface_v1_set_anchor(panel->layer_surface, anchor);
     zwlr_layer_surface_v1_set_exclusive_zone(panel->layer_surface, -1);
     zwlr_layer_surface_v1_set_keyboard_interactivity(panel->layer_surface,
         ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
     
-    /* Initial commit to trigger configure event */
     wl_surface_commit(panel->wl_surface);
-    
-    LOG("Created panel %ux%u anchor=0x%x on %s\n", width, height, anchor,
-        output ? output->name : "default");
     return panel;
 }
 
 static void destroy_panel(panel_t *panel) {
     if (!panel) return;
-    
     destroy_panel_buffer(panel);
-    
-    if (panel->layer_surface) {
-        zwlr_layer_surface_v1_destroy(panel->layer_surface);
-    }
-    if (panel->wl_surface) {
-        wl_surface_destroy(panel->wl_surface);
-    }
+    if (panel->layer_surface) zwlr_layer_surface_v1_destroy(panel->layer_surface);
+    if (panel->wl_surface) wl_surface_destroy(panel->wl_surface);
     free(panel);
 }
 
 /* ========== Config Loading ========== */
-
-static char *trim(char *s) {
-    while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') s++;
-    if (!*s) return s;  // Handle empty string
-    char *e = s + strlen(s) - 1;
-    while (e > s && (*e == '\n' || *e == '\r' || *e == ' ' || *e == '\t')) *e-- = '\0';
-    // Strip surrounding quotes (QSettings adds them for some values)
-    size_t len = strlen(s);
-    if (len >= 2 && s[0] == '"' && s[len-1] == '"') {
-        s[len-1] = '\0';
-        s++;
-    }
-    return s;
-}
 
 static char *get_config_value(const char *path, const char *key) {
     FILE *f = fopen(path, "r");
@@ -574,21 +405,34 @@ static char *get_config_value(const char *path, const char *key) {
     
     while (fgets(line, sizeof(line), f)) {
         if (line[0] == '#' || line[0] == ';' || line[0] == '[') continue;
-        
         char *eq = strchr(line, '=');
         if (!eq) continue;
         
-        *eq = '\0';
-        char *k = trim(line);
-        char *v = trim(eq + 1);
+        /* Trim key */
+        char *k = line;
+        while (*k == ' ' || *k == '\t') k++;
+        char *kend = eq;
+        while (kend > k && (*(kend-1) == ' ' || *(kend-1) == '\t')) kend--;
         
-        if (strcmp(k, key) == 0) {
-            strncpy(value, v, sizeof(value) - 1);
-            fclose(f);
-            return value;
+        if ((size_t)(kend - k) != keylen || strncmp(k, key, keylen) != 0) continue;
+        
+        /* Trim value */
+        char *v = eq + 1;
+        while (*v == ' ' || *v == '\t') v++;
+        char *vend = v + strlen(v);
+        while (vend > v && (*(vend-1) == '\n' || *(vend-1) == '\r' || *(vend-1) == ' ')) vend--;
+        *vend = '\0';
+        
+        /* Strip quotes */
+        if (vend - v >= 2 && v[0] == '"' && *(vend-1) == '"') {
+            v++;
+            *(vend-1) = '\0';
         }
+        
+        strncpy(value, v, sizeof(value) - 1);
+        fclose(f);
+        return value;
     }
-    
     fclose(f);
     return NULL;
 }
@@ -605,24 +449,20 @@ static void load_config(void) {
     snprintf(path, sizeof(path), "%s/.config/ringlight/config.ini", home);
     
     char *v;
-    
     if ((v = get_config_value(path, "width"))) {
         cfg_border_width = atoi(v);
         if (cfg_border_width < 1) cfg_border_width = 1;
         if (cfg_border_width > 500) cfg_border_width = 500;
     }
-    
     if ((v = get_config_value(path, "brightness"))) {
         cfg_brightness = atoi(v);
         if (cfg_brightness < 1) cfg_brightness = 1;
         if (cfg_brightness > 100) cfg_brightness = 100;
     }
-    
     if ((v = get_config_value(path, "color"))) {
         if (v[0] == '#') v++;
         cfg_color = strtoul(v, NULL, 16);
     }
-    
     if ((v = get_config_value(path, "fullscreen"))) {
         cfg_fullscreen = (strcmp(v, "true") == 0 || strcmp(v, "1") == 0);
     }
@@ -633,23 +473,20 @@ static void load_config(void) {
 static void print_usage(const char *prog) {
     printf("ringlight-overlay - Screen ring light for Wayland\n\n");
     printf("Usage: %s [options]\n\n", prog);
-    printf("Options:\n");
-    printf("  -s, --screen N|NAME  Screen index or name (default: first screen)\n");
+    printf("  -s, --screen N|NAME  Screen index or name\n");
     printf("  -w, --width N        Border width in pixels (default: 80)\n");
     printf("  -c, --color RRGGBB   Color in hex (default: FFFFFF)\n");
     printf("  -b, --brightness N   Brightness 1-100 (default: 100)\n");
     printf("  -f, --fullscreen     Full screen mode\n");
-    printf("  -l, --list           List available screens and exit\n");
+    printf("  -l, --list           List screens and exit\n");
     printf("  -v, --verbose        Verbose output\n");
     printf("  -h, --help           Show this help\n");
-    printf("\nClick on the overlay or press Ctrl+C to exit.\n");
+    printf("\nClick on the overlay to close.\n");
 }
 
 int main(int argc, char *argv[]) {
-    /* Load config file first */
     load_config();
     
-    /* Parse command line */
     static struct option long_opts[] = {
         {"screen", required_argument, 0, 's'},
         {"width", required_argument, 0, 'w'},
@@ -665,228 +502,115 @@ int main(int argc, char *argv[]) {
     int opt;
     while ((opt = getopt_long(argc, argv, "s:w:c:b:flvh", long_opts, NULL)) != -1) {
         switch (opt) {
-        case 's':
-            strncpy(cfg_target_name, optarg, sizeof(cfg_target_name) - 1);
-            break;
-        case 'w':
-            cfg_border_width = atoi(optarg);
-            if (cfg_border_width < 1) cfg_border_width = 1;
-            if (cfg_border_width > 500) cfg_border_width = 500;
-            break;
-        case 'c':
-            if (optarg[0] == '#') optarg++;
-            cfg_color = strtoul(optarg, NULL, 16);
-            break;
-        case 'b':
-            cfg_brightness = atoi(optarg);
-            if (cfg_brightness < 1) cfg_brightness = 1;
-            if (cfg_brightness > 100) cfg_brightness = 100;
-            break;
-        case 'f':
-            cfg_fullscreen = true;
-            break;
-        case 'l':
-            cfg_list_only = true;
-            break;
-        case 'v':
-            cfg_verbose = true;
-            break;
-        case 'h':
-            print_usage(argv[0]);
-            return 0;
-        default:
-            print_usage(argv[0]);
-            return 1;
+        case 's': strncpy(cfg_target_name, optarg, sizeof(cfg_target_name) - 1); break;
+        case 'w': cfg_border_width = atoi(optarg); if (cfg_border_width < 1) cfg_border_width = 1; if (cfg_border_width > 500) cfg_border_width = 500; break;
+        case 'c': if (optarg[0] == '#') optarg++; cfg_color = strtoul(optarg, NULL, 16); break;
+        case 'b': cfg_brightness = atoi(optarg); if (cfg_brightness < 1) cfg_brightness = 1; if (cfg_brightness > 100) cfg_brightness = 100; break;
+        case 'f': cfg_fullscreen = true; break;
+        case 'l': cfg_list_only = true; break;
+        case 'v': cfg_verbose = true; break;
+        case 'h': print_usage(argv[0]); return 0;
+        default: print_usage(argv[0]); return 1;
         }
     }
     
-    /* Connect to Wayland */
     wl_display = wl_display_connect(NULL);
-    if (!wl_display) {
-        ERR("Failed to connect to Wayland display\n");
-        return 1;
-    }
+    if (!wl_display) { ERR("Failed to connect to Wayland\n"); return 1; }
     
-    /* Get registry and bind globals */
     wl_registry = wl_display_get_registry(wl_display);
     wl_registry_add_listener(wl_registry, &registry_listener, NULL);
     wl_display_roundtrip(wl_display);
-    
-    /* Wait for output info to arrive */
+    wl_display_roundtrip(wl_display);
     wl_display_roundtrip(wl_display);
     
-    /* Another roundtrip to ensure all output names are received */
-    wl_display_roundtrip(wl_display);
-    
-    /* Check required interfaces */
-    if (!wl_compositor) {
-        ERR("Compositor doesn't support wl_compositor\n");
-        return 1;
-    }
-    if (!wl_shm) {
-        ERR("Compositor doesn't support wl_shm\n");
-        return 1;
-    }
-    if (!layer_shell) {
-        ERR("Compositor doesn't support wlr-layer-shell-unstable-v1\n");
-        ERR("Make sure you're running KDE Plasma 5.20+, Sway, or another compatible compositor\n");
+    if (!wl_compositor || !wl_shm || !layer_shell) {
+        ERR("Missing required Wayland interfaces\n");
         return 1;
     }
     
-    /* List mode */
     if (cfg_list_only) {
         printf("Available screens:\n");
-        for (int i = 0; i < num_outputs; i++) {
-            printf("  %d: %s (%dx%d @ %d,%d)\n", 
-                   i, outputs[i].name, 
-                   outputs[i].width, outputs[i].height,
-                   outputs[i].x, outputs[i].y);
-        }
+        for (int i = 0; i < num_outputs; i++)
+            printf("  %d: %s (%dx%d @ %d,%d)\n", i, outputs[i].name,
+                   outputs[i].width, outputs[i].height, outputs[i].x, outputs[i].y);
         wl_display_disconnect(wl_display);
         return 0;
     }
     
-    if (num_outputs == 0) {
-        ERR("No outputs found\n");
-        return 1;
-    }
+    if (num_outputs == 0) { ERR("No outputs found\n"); return 1; }
     
     /* Find target output */
     output_t *target = NULL;
-    
     if (cfg_target_name[0]) {
-        /* First try to match by exact name */
         for (int i = 0; i < num_outputs; i++) {
             if (strcmp(outputs[i].name, cfg_target_name) == 0) {
                 target = &outputs[i];
-                LOG("Matched output by name: %s\n", outputs[i].name);
                 break;
             }
         }
-        
-        /* If no name match, try as numeric index */
         if (!target) {
-            char *endptr;
-            long idx = strtol(cfg_target_name, &endptr, 10);
-            if (*endptr == '\0' && idx >= 0 && idx < num_outputs) {
+            char *end;
+            long idx = strtol(cfg_target_name, &end, 10);
+            if (*end == '\0' && idx >= 0 && idx < num_outputs)
                 target = &outputs[idx];
-                LOG("Matched output by index: %ld -> %s\n", idx, target->name);
-            }
         }
-        
         if (!target) {
-            ERR("Screen '%s' not found. Use -l to list available screens.\n", cfg_target_name);
-            wl_display_disconnect(wl_display);
+            ERR("Screen '%s' not found\n", cfg_target_name);
             return 1;
         }
     } else {
-        /* No target specified - use first output */
         target = &outputs[0];
-        LOG("Using default output: %s\n", target->name);
     }
     
-    printf("%s on %s (%dx%d @ %d,%d)\n",
-           cfg_fullscreen ? "Fullscreen" : "Ring",
-           target->name, target->width, target->height,
-           target->x, target->y);
-    printf("Click on the overlay to close.\n");
+    printf("%s on %s (%dx%d)\n", cfg_fullscreen ? "Fullscreen" : "Ring",
+           target->name, target->width, target->height);
     
     /* Create panels */
     if (cfg_fullscreen) {
-        uint32_t anchor = ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
-                         ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM |
-                         ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
-                         ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT;
+        uint32_t anchor = ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP | ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM |
+                         ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT | ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT;
         panels[num_panels++] = create_panel(target, anchor, 0, 0);
     } else {
-        /* Top */
         panels[num_panels++] = create_panel(target,
-            ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
-            ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
-            ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT,
+            ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP | ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT | ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT,
             0, cfg_border_width);
-        
-        /* Bottom */
         panels[num_panels++] = create_panel(target,
-            ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM |
-            ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
-            ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT,
+            ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM | ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT | ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT,
             0, cfg_border_width);
-        
-        /* Left */
         panels[num_panels++] = create_panel(target,
-            ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
-            ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
-            ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM,
+            ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT | ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP | ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM,
             cfg_border_width, 0);
-        
-        /* Right */
         panels[num_panels++] = create_panel(target,
-            ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT |
-            ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
-            ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM,
+            ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT | ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP | ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM,
             cfg_border_width, 0);
     }
     
-    /* Verify panels created */
-    for (int i = 0; i < num_panels; i++) {
-        if (!panels[i]) {
-            ERR("Failed to create panel %d\n", i);
-            running = 0;
-            break;
-        }
-    }
-    
-    /* Setup signal handlers */
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
     
-    /* Process events until all panels are configured */
-    LOG("Waiting for configure events...\n");
+    /* Wait for configure */
     while (running) {
-        if (wl_display_dispatch(wl_display) < 0) {
-            ERR("Wayland dispatch error\n");
-            break;
-        }
-        
-        /* Check if all panels configured */
-        bool all_configured = true;
-        for (int i = 0; i < num_panels; i++) {
-            if (panels[i] && !panels[i]->configured) {
-                all_configured = false;
-                break;
-            }
-        }
-        if (all_configured) {
-            LOG("All panels configured, entering main loop\n");
-            break;
-        }
+        if (wl_display_dispatch(wl_display) < 0) break;
+        bool all_done = true;
+        for (int i = 0; i < num_panels; i++)
+            if (panels[i] && !panels[i]->configured) { all_done = false; break; }
+        if (all_done) break;
     }
     
-    /* Main event loop */
+    /* Main loop */
     while (running) {
-        if (wl_display_dispatch(wl_display) < 0) {
-            break;
-        }
+        if (wl_display_dispatch(wl_display) < 0) break;
     }
-    
-    LOG("Shutting down...\n");
     
     /* Cleanup */
-    for (int i = 0; i < num_panels; i++) {
-        destroy_panel(panels[i]);
-    }
-    
+    for (int i = 0; i < num_panels; i++) destroy_panel(panels[i]);
     if (wl_pointer) wl_pointer_destroy(wl_pointer);
     if (wl_seat) wl_seat_destroy(wl_seat);
     if (layer_shell) zwlr_layer_shell_v1_destroy(layer_shell);
     if (wl_shm) wl_shm_destroy(wl_shm);
     if (wl_compositor) wl_compositor_destroy(wl_compositor);
-    
-    for (int i = 0; i < num_outputs; i++) {
+    for (int i = 0; i < num_outputs; i++)
         if (outputs[i].wl_output) wl_output_destroy(outputs[i].wl_output);
-    }
-    
     wl_registry_destroy(wl_registry);
     wl_display_disconnect(wl_display);
     

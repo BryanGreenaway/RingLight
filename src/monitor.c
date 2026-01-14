@@ -1,5 +1,5 @@
 /*
- * RingLight Monitor - Webcam/Howdy detector for automatic ring light
+ * RingLight Monitor - Lightweight webcam detector daemon
  * License: MIT
  */
 
@@ -24,48 +24,37 @@
 #define MAX_ITEMS 16
 
 static volatile sig_atomic_t running = 1;
-static pid_t overlay_pids[MAX_ITEMS] = {0};
+static pid_t overlay_pids[MAX_ITEMS];
 static int overlay_count = 0;
 static bool verbose = false;
 
-// Config
 static char video_dev[256] = "/dev/video0";
-static int poll_ms = 150;
+static char video_dev_real[PATH_MAX] = "";
+static int poll_ms = 1000;  /* Was 150ms - key optimization! */
 static char color[32] = "FFFFFF";
-static int brightness = 100;
-static int width = 80;
+static int brightness = 100, width = 80;
 static bool fullscreen = false;
-static char *procs[MAX_ITEMS] = {NULL};
-static int proc_count = 0;
-static char *screens[MAX_ITEMS] = {NULL};
-static int screen_count = 0;
+static char *procs[MAX_ITEMS], *screens[MAX_ITEMS];
+static int proc_count = 0, screen_count = 0;
 
 static void sig_handler(int s) { (void)s; running = 0; }
-
-#define log_msg(...) do { if (verbose) { fprintf(stderr, "[ringlight-monitor] " __VA_ARGS__); fprintf(stderr, "\n"); } } while(0)
+#define log_msg(...) do { if (verbose) fprintf(stderr, "[ringlight-monitor] " __VA_ARGS__); } while(0)
 
 static char *trim(char *s) {
     while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') s++;
-    if (!*s) return s;  // Handle empty string
+    if (!*s) return s;
     char *e = s + strlen(s) - 1;
     while (e > s && (*e == '\n' || *e == '\r' || *e == ' ' || *e == '\t')) *e-- = '\0';
-    // Strip surrounding quotes (QSettings adds them for comma-separated values)
-    size_t len = strlen(s);
-    if (len >= 2 && s[0] == '"' && s[len-1] == '"') {
-        s[len-1] = '\0';
-        s++;
-    }
+    if (strlen(s) >= 2 && s[0] == '"' && s[strlen(s)-1] == '"') { s[strlen(s)-1] = '\0'; s++; }
     return s;
 }
 
 static char *get_config(const char *path, const char *key) {
     FILE *f = fopen(path, "r");
     if (!f) return NULL;
-    
     static char val[256];
     char line[512];
     size_t klen = strlen(key);
-    
     while (fgets(line, sizeof(line), f)) {
         if (line[0] == '#' || line[0] == ';' || line[0] == '[') continue;
         char *eq = strchr(line, '=');
@@ -81,11 +70,7 @@ static char *get_config(const char *path, const char *key) {
 static void parse_list(const char *str, char **arr, int *cnt, int max) {
     if (!str || !*str) return;
     char *copy = strdup(str), *tok = strtok(copy, ",");
-    while (tok && *cnt < max) {
-        tok = trim(tok);
-        if (*tok) arr[(*cnt)++] = strdup(tok);
-        tok = strtok(NULL, ",");
-    }
+    while (tok && *cnt < max) { tok = trim(tok); if (*tok) arr[(*cnt)++] = strdup(tok); tok = strtok(NULL, ","); }
     free(copy);
 }
 
@@ -96,216 +81,143 @@ static void load_config(void) {
     
     char path[PATH_MAX];
     snprintf(path, sizeof(path), "%s/.config/ringlight/config.ini", home);
-    log_msg("Loading config: %s", path);
     
     char *v;
-    if ((v = get_config(path, "color"))) { strncpy(color, v[0] == '#' ? v+1 : v, sizeof(color)-1); log_msg("  color: %s", color); }
-    if ((v = get_config(path, "brightness"))) { brightness = atoi(v); if (brightness < 1) brightness = 1; if (brightness > 100) brightness = 100; }
-    if ((v = get_config(path, "width"))) { width = atoi(v); if (width < 10) width = 10; if (width > 500) width = 500; }
-    if ((v = get_config(path, "fullscreen"))) { fullscreen = (strcmp(v, "true") == 0 || strcmp(v, "1") == 0); log_msg("  fullscreen: %s", fullscreen ? "yes" : "no"); }
+    if ((v = get_config(path, "color"))) strncpy(color, v[0] == '#' ? v+1 : v, sizeof(color)-1);
+    if ((v = get_config(path, "brightness"))) { brightness = atoi(v); brightness = brightness < 1 ? 1 : brightness > 100 ? 100 : brightness; }
+    if ((v = get_config(path, "width"))) { width = atoi(v); width = width < 10 ? 10 : width > 500 ? 500 : width; }
+    if ((v = get_config(path, "fullscreen"))) fullscreen = (strcmp(v, "true") == 0 || strcmp(v, "1") == 0);
     if ((v = get_config(path, "videoDevice")) && *v) strncpy(video_dev, v, sizeof(video_dev)-1);
     if ((v = get_config(path, "processes"))) parse_list(v, procs, &proc_count, MAX_ITEMS);
-    // Use screen names (enabledScreens) instead of indices for reliable targeting
-    if ((v = get_config(path, "enabledScreens"))) {
-        parse_list(v, screens, &screen_count, MAX_ITEMS);
-        log_msg("  enabledScreens: '%s' -> %d screen(s)", v, screen_count);
-    }
-    else if ((v = get_config(path, "enabledScreenIndices"))) {
-        parse_list(v, screens, &screen_count, MAX_ITEMS);
-        log_msg("  enabledScreenIndices: '%s' -> %d screen(s)", v, screen_count);
-    }
-    
-    for (int i = 0; i < screen_count; i++) {
-        log_msg("    screen[%d] = '%s'", i, screens[i]);
-    }
-    
-    if (proc_count == 0) procs[proc_count++] = "howdy";
+    if ((v = get_config(path, "enabledScreens"))) parse_list(v, screens, &screen_count, MAX_ITEMS);
+    else if ((v = get_config(path, "enabledScreenIndices"))) parse_list(v, screens, &screen_count, MAX_ITEMS);
+    if (proc_count == 0) procs[proc_count++] = strdup("howdy");
+    if (!realpath(video_dev, video_dev_real)) strncpy(video_dev_real, video_dev, sizeof(video_dev_real) - 1);
 }
 
-static bool proc_running(const char *name) {
+/* Single-pass /proc scan - checks process names AND fd targets in one traversal */
+static bool scan_proc(void) {
     DIR *d = opendir("/proc");
     if (!d) return false;
+    pid_t mypid = getpid();
     struct dirent *e;
-    while ((e = readdir(d))) {
-        if (e->d_type != DT_DIR) continue;
-        char *end; long pid = strtol(e->d_name, &end, 10);
-        if (*end || pid <= 0) continue;
+    bool found = false;
+    
+    while (!found && (e = readdir(d))) {
+        if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+        long pid = strtol(e->d_name, NULL, 10);
+        if (pid <= 0 || pid == mypid) continue;
         
-        char p[280], c[256];
-        snprintf(p, sizeof(p), "/proc/%s/comm", e->d_name);
-        FILE *f = fopen(p, "r");
-        if (!f) continue;
-        if (fgets(c, sizeof(c), f)) {
-            c[strcspn(c, "\n")] = 0;
-            if (strcmp(c, name) == 0) { fclose(f); closedir(d); return true; }
+        char path[280];
+        /* Check process name */
+        snprintf(path, sizeof(path), "/proc/%s/comm", e->d_name);
+        FILE *f = fopen(path, "r");
+        if (f) {
+            char comm[64];
+            if (fgets(comm, sizeof(comm), f)) {
+                comm[strcspn(comm, "\n")] = '\0';
+                for (int i = 0; i < proc_count && !found; i++)
+                    if (strcmp(comm, procs[i]) == 0) { log_msg("Process: %s\n", procs[i]); found = true; }
+            }
+            fclose(f);
         }
-        fclose(f);
-    }
-    closedir(d);
-    return false;
-}
-
-static bool watched_active(void) {
-    for (int i = 0; i < proc_count && procs[i]; i++)
-        if (proc_running(procs[i])) { log_msg("Process active: %s", procs[i]); return true; }
-    return false;
-}
-
-static bool dev_in_use(const char *dev) {
-    char rp[PATH_MAX];
-    if (!realpath(dev, rp)) return false;
-    
-    DIR *d = opendir("/proc");
-    if (!d) return false;
-    struct dirent *e;
-    while ((e = readdir(d))) {
-        if (e->d_type != DT_DIR) continue;
-        char *end; long pid = strtol(e->d_name, &end, 10);
-        if (*end || pid <= 0 || pid == getpid()) continue;
+        if (found) break;
         
-        char fp[280];
-        snprintf(fp, sizeof(fp), "/proc/%s/fd", e->d_name);
-        DIR *fds = opendir(fp);
+        /* Check file descriptors */
+        snprintf(path, sizeof(path), "/proc/%s/fd", e->d_name);
+        DIR *fds = opendir(path);
         if (!fds) continue;
-        
         struct dirent *fe;
         while ((fe = readdir(fds))) {
             char lp[512], t[PATH_MAX];
-            snprintf(lp, sizeof(lp), "%s/%s", fp, fe->d_name);
-            ssize_t l = readlink(lp, t, sizeof(t)-1);
-            if (l > 0) { t[l] = 0; if (strcmp(t, rp) == 0) {
-                log_msg("Device in use by PID %s", e->d_name);
-                closedir(fds); closedir(d); return true;
-            }}
+            snprintf(lp, sizeof(lp), "%s/%s", path, fe->d_name);
+            ssize_t l = readlink(lp, t, sizeof(t) - 1);
+            if (l > 0) { t[l] = '\0'; if (strcmp(t, video_dev_real) == 0) { log_msg("FD open by %ld\n", pid); found = true; break; } }
         }
         closedir(fds);
     }
     closedir(d);
-    return false;
+    return found;
 }
 
-static bool v4l2_busy(const char *dev) {
-    int fd = open(dev, O_RDONLY|O_NONBLOCK);
+static bool v4l2_busy(void) {
+    int fd = open(video_dev, O_RDONLY | O_NONBLOCK);
     if (fd < 0) return false;
     struct v4l2_requestbuffers r = {.type = V4L2_BUF_TYPE_VIDEO_CAPTURE, .memory = V4L2_MEMORY_MMAP};
     int ret = ioctl(fd, VIDIOC_REQBUFS, &r);
     int err = errno;
     close(fd);
-    if (ret < 0 && err == EBUSY) { log_msg("V4L2 device streaming"); return true; }
-    return false;
+    return (ret < 0 && err == EBUSY);
 }
 
-static bool cam_active(void) {
-    return watched_active() || dev_in_use(video_dev) || v4l2_busy(video_dev);
-}
+static bool cam_active(void) { return scan_proc() || v4l2_busy(); }
 
 static void start_overlay(void) {
-    // Check if already running
     if (overlay_count > 0 && overlay_pids[0] > 0 && kill(overlay_pids[0], 0) == 0) return;
-    
-    log_msg("Starting overlay(s) - %d configured screen(s)", screen_count);
+    log_msg("Starting overlay\n");
     
     char bstr[16], wstr[16];
     snprintf(bstr, sizeof(bstr), "%d", brightness);
     snprintf(wstr, sizeof(wstr), "%d", width);
     
-    // Spawn one process per screen (or just one with default if no screens specified)
-    int num_screens = screen_count > 0 ? screen_count : 1;
+    int n = screen_count > 0 ? screen_count : 1;
     overlay_count = 0;
-    
-    for (int i = 0; i < num_screens && overlay_count < MAX_ITEMS; i++) {
+    for (int i = 0; i < n && overlay_count < MAX_ITEMS; i++) {
         pid_t p = fork();
-        if (p < 0) { perror("fork"); continue; }
-        
+        if (p < 0) continue;
         if (p == 0) {
             char *argv[16] = {"ringlight-overlay", "-c", color, "-b", bstr, "-w", wstr};
             int c = 7;
-            if (fullscreen) {
-                argv[c++] = "-f";
-            }
-            if (screen_count > 0 && screens[i] && screens[i][0]) {
-                argv[c++] = "-s";
-                argv[c++] = screens[i];
-            }
+            if (fullscreen) argv[c++] = "-f";
+            if (screen_count > 0 && screens[i]) { argv[c++] = "-s"; argv[c++] = screens[i]; }
             argv[c] = NULL;
             execvp("ringlight-overlay", argv);
             _exit(1);
         }
-        
         overlay_pids[overlay_count++] = p;
-        if (screen_count > 0 && screens[i]) {
-            log_msg("Started PID %d for screen '%s'", p, screens[i]);
-        } else {
-            log_msg("Started PID %d for default screen", p);
-        }
     }
 }
 
 static void stop_overlay(void) {
     if (overlay_count == 0) return;
-    
-    log_msg("Stopping %d overlay(s)", overlay_count);
-    
-    // Send SIGTERM to all
-    for (int i = 0; i < overlay_count; i++) {
-        if (overlay_pids[i] > 0) kill(overlay_pids[i], SIGTERM);
-    }
-    
-    // Wait for termination
+    log_msg("Stopping overlay\n");
+    for (int i = 0; i < overlay_count; i++) if (overlay_pids[i] > 0) kill(overlay_pids[i], SIGTERM);
     for (int j = 0; j < 10; j++) {
-        bool all_done = true;
-        for (int i = 0; i < overlay_count; i++) {
-            if (overlay_pids[i] > 0 && waitpid(overlay_pids[i], NULL, WNOHANG) == 0) {
-                all_done = false;
-            } else {
-                overlay_pids[i] = 0;
-            }
-        }
-        if (all_done) break;
+        bool done = true;
+        for (int i = 0; i < overlay_count; i++)
+            if (overlay_pids[i] > 0 && waitpid(overlay_pids[i], NULL, WNOHANG) == 0) done = false;
+            else overlay_pids[i] = 0;
+        if (done) break;
         usleep(50000);
     }
-    
-    // Force kill any remaining
-    for (int i = 0; i < overlay_count; i++) {
-        if (overlay_pids[i] > 0) {
-            kill(overlay_pids[i], SIGKILL);
-            waitpid(overlay_pids[i], NULL, 0);
-            overlay_pids[i] = 0;
-        }
-    }
-    
+    for (int i = 0; i < overlay_count; i++) if (overlay_pids[i] > 0) { kill(overlay_pids[i], SIGKILL); waitpid(overlay_pids[i], NULL, 0); }
     overlay_count = 0;
 }
-
-static void cleanup(void) { stop_overlay(); }
 
 int main(int argc, char *argv[]) {
     static struct option opts[] = {
         {"device", 1, 0, 'd'}, {"interval", 1, 0, 'i'}, {"process", 1, 0, 'p'},
         {"color", 1, 0, 'c'}, {"brightness", 1, 0, 'b'}, {"width", 1, 0, 'w'},
-        {"screens", 1, 0, 's'}, {"fullscreen", 0, 0, 'f'}, {"verbose", 0, 0, 'v'}, 
-        {"help", 0, 0, 'h'}, {0}
+        {"screens", 1, 0, 's'}, {"fullscreen", 0, 0, 'f'}, {"verbose", 0, 0, 'v'}, {"help", 0, 0, 'h'}, {0}
     };
     
-    // Temp storage for CLI overrides
-    char *cli_procs[MAX_ITEMS] = {NULL}; int cli_proc_cnt = 0;
-    char *cli_screens[MAX_ITEMS] = {NULL}; int cli_screen_cnt = 0;
-    char cli_color[32] = "", cli_dev[256] = "";
-    int cli_bright = 0, cli_width = 0;
-    bool cli_fullscreen = false;
-    bool has_procs = false, has_screens = false, has_color = false, has_bright = false, has_width = false, has_dev = false, has_fullscreen = false;
+    char *cli_procs[MAX_ITEMS] = {0}, *cli_screens[MAX_ITEMS] = {0};
+    int cli_pc = 0, cli_sc = 0;
+    char cli_col[32] = "", cli_dev[256] = "";
+    int cli_br = 0, cli_wd = 0;
+    bool has_p = false, has_s = false, has_c = false, has_br = false, has_wd = false, has_d = false, has_f = false;
     
     int o;
     while ((o = getopt_long(argc, argv, "d:i:p:c:b:w:s:fvh", opts, NULL)) != -1) {
         switch (o) {
-        case 'd': strncpy(cli_dev, optarg, sizeof(cli_dev)-1); has_dev = true; break;
-        case 'i': poll_ms = atoi(optarg); if (poll_ms < 10) poll_ms = 10; break;
-        case 'p': if (cli_proc_cnt < MAX_ITEMS) cli_procs[cli_proc_cnt++] = strdup(optarg); has_procs = true; break;
-        case 'c': strncpy(cli_color, optarg, sizeof(cli_color)-1); has_color = true; break;
-        case 'b': cli_bright = atoi(optarg); has_bright = true; break;
-        case 'w': cli_width = atoi(optarg); has_width = true; break;
-        case 's': parse_list(optarg, cli_screens, &cli_screen_cnt, MAX_ITEMS); has_screens = true; break;
-        case 'f': cli_fullscreen = true; has_fullscreen = true; break;
+        case 'd': strncpy(cli_dev, optarg, sizeof(cli_dev)-1); has_d = true; break;
+        case 'i': poll_ms = atoi(optarg); if (poll_ms < 100) poll_ms = 100; break;
+        case 'p': if (cli_pc < MAX_ITEMS) cli_procs[cli_pc++] = strdup(optarg); has_p = true; break;
+        case 'c': strncpy(cli_col, optarg, sizeof(cli_col)-1); has_c = true; break;
+        case 'b': cli_br = atoi(optarg); has_br = true; break;
+        case 'w': cli_wd = atoi(optarg); has_wd = true; break;
+        case 's': parse_list(optarg, cli_screens, &cli_sc, MAX_ITEMS); has_s = true; break;
+        case 'f': has_f = true; break;
         case 'v': verbose = true; break;
         case 'h': printf("ringlight-monitor - Auto ring light\nUsage: %s [-d dev] [-i ms] [-p proc] [-c hex] [-b 1-100] [-w px] [-s screens] [-f] [-v]\n", argv[0]); return 0;
         }
@@ -313,22 +225,20 @@ int main(int argc, char *argv[]) {
     
     load_config();
     
-    // Apply CLI overrides
-    if (has_dev) strncpy(video_dev, cli_dev, sizeof(video_dev)-1);
-    if (has_color) strncpy(color, cli_color, sizeof(color)-1);
-    if (has_bright) { brightness = cli_bright; if (brightness < 1) brightness = 1; if (brightness > 100) brightness = 100; }
-    if (has_width) { width = cli_width; if (width < 10) width = 10; if (width > 500) width = 500; }
-    if (has_fullscreen) fullscreen = cli_fullscreen;
-    if (has_procs) { proc_count = 0; for (int i = 0; i < cli_proc_cnt; i++) procs[proc_count++] = cli_procs[i]; }
-    if (has_screens) { screen_count = 0; for (int i = 0; i < cli_screen_cnt; i++) screens[screen_count++] = cli_screens[i]; }
+    if (has_d) { strncpy(video_dev, cli_dev, sizeof(video_dev)-1); realpath(video_dev, video_dev_real) || strncpy(video_dev_real, video_dev, sizeof(video_dev_real)-1); }
+    if (has_c) strncpy(color, cli_col, sizeof(color)-1);
+    if (has_br) { brightness = cli_br; brightness = brightness < 1 ? 1 : brightness > 100 ? 100 : brightness; }
+    if (has_wd) { width = cli_wd; width = width < 10 ? 10 : width > 500 ? 500 : width; }
+    if (has_f) fullscreen = true;
+    if (has_p) { proc_count = 0; for (int i = 0; i < cli_pc; i++) procs[proc_count++] = cli_procs[i]; }
+    if (has_s) { screen_count = 0; for (int i = 0; i < cli_sc; i++) screens[screen_count++] = cli_screens[i]; }
     
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
     signal(SIGCHLD, SIG_IGN);
-    atexit(cleanup);
+    atexit(stop_overlay);
     
-    log_msg("Monitoring %s @ %dms, %d proc(s), color=%s bright=%d width=%d fullscreen=%s", 
-            video_dev, poll_ms, proc_count, color, brightness, width, fullscreen ? "yes" : "no");
+    log_msg("Monitoring %s @ %dms\n", video_dev, poll_ms);
     
     bool was = false;
     while (running) {
