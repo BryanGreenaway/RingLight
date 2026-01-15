@@ -1,0 +1,38 @@
+# Pacman install hooks for ringlight
+
+post_install() {
+    echo "==> Setting capabilities for instant process detection..."
+    if setcap cap_net_admin+ep /usr/bin/ringlight-monitor 2>/dev/null; then
+        echo "    Capabilities set successfully"
+    else
+        echo "    Note: Could not set capabilities (needs root)"
+        echo "    ringlight-monitor will use polling mode"
+        echo "    To enable instant detection:"
+        echo "      sudo setcap cap_net_admin+ep /usr/bin/ringlight-monitor"
+    fi
+    
+    echo ""
+    echo "==> RingLight installed successfully!"
+    echo "    Start the GUI:           ringlight-gui"
+    echo "    Enable auto-start:       systemctl --user enable --now ringlight-monitor"
+    echo ""
+}
+
+post_upgrade() {
+    post_install
+}
+
+pre_remove() {
+    echo "==> Stopping ringlight services..."
+    # Stop user services for all logged-in users
+    for user_dir in /run/user/*; do
+        if [ -d "$user_dir" ]; then
+            uid=$(basename "$user_dir")
+            sudo -u "#$uid" systemctl --user stop ringlight-monitor 2>/dev/null || true
+        fi
+    done
+    
+    # Kill any running instances
+    pkill -x ringlight-monitor 2>/dev/null || true
+    pkill -x ringlight-overlay 2>/dev/null || true
+}

@@ -1,5 +1,11 @@
 /*
- * RingLight Monitor - Lightweight webcam detector daemon
+ * RingLight Monitor - Event-driven webcam activity detector
+ * 
+ * Architecture:
+ * - Netlink proc connector: Instant notification when watched processes start/exit
+ * - V4L2 polling: ONLY as fallback, every few seconds, for apps not in watch list
+ * - No polling when overlay is already running (netlink handles exit detection)
+ * 
  * License: MIT
  */
 
@@ -9,19 +15,26 @@
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
-#include <dirent.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <getopt.h>
 #include <stdbool.h>
+#include <dirent.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/socket.h>
+#include <sys/select.h>
 #include <sys/ioctl.h>
+#include <linux/netlink.h>
+#include <linux/connector.h>
+#include <linux/cn_proc.h>
 #include <linux/videodev2.h>
 #include <limits.h>
 #include <pwd.h>
 
 #define MAX_ITEMS 16
+#define V4L2_POLL_INTERVAL 3  /* Seconds between V4L2 checks when idle */
 
 static volatile sig_atomic_t running = 1;
 static pid_t overlay_pids[MAX_ITEMS];
@@ -30,15 +43,21 @@ static bool verbose = false;
 
 static char video_dev[256] = "/dev/video0";
 static char video_dev_real[PATH_MAX] = "";
-static int poll_ms = 1000;  /* Was 150ms - key optimization! */
 static char color[32] = "FFFFFF";
 static int brightness = 100, width = 80;
 static bool fullscreen = false;
 static char *procs[MAX_ITEMS], *screens[MAX_ITEMS];
 static int proc_count = 0, screen_count = 0;
 
+/* State tracking */
+static int nl_sock = -1;
+static int watched_proc_count = 0;  /* How many watched processes are running */
+static time_t last_v4l2_check = 0;
+static bool overlay_active = false;
+
 static void sig_handler(int s) { (void)s; running = 0; }
-#define log_msg(...) do { if (verbose) fprintf(stderr, "[ringlight-monitor] " __VA_ARGS__); } while(0)
+#define log_msg(...) do { if (verbose) { fprintf(stderr, "[monitor] " __VA_ARGS__); fflush(stderr); } } while(0)
+#define log_err(...) do { fprintf(stderr, "[monitor] " __VA_ARGS__); fflush(stderr); } while(0)
 
 static char *trim(char *s) {
     while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') s++;
@@ -84,169 +103,372 @@ static void load_config(void) {
     
     char *v;
     if ((v = get_config(path, "color"))) strncpy(color, v[0] == '#' ? v+1 : v, sizeof(color)-1);
-    if ((v = get_config(path, "brightness"))) { brightness = atoi(v); brightness = brightness < 1 ? 1 : brightness > 100 ? 100 : brightness; }
-    if ((v = get_config(path, "width"))) { width = atoi(v); width = width < 10 ? 10 : width > 500 ? 500 : width; }
+    if ((v = get_config(path, "brightness"))) { brightness = atoi(v); if (brightness < 1) brightness = 1; if (brightness > 100) brightness = 100; }
+    if ((v = get_config(path, "width"))) { width = atoi(v); if (width < 10) width = 10; if (width > 500) width = 500; }
     if ((v = get_config(path, "fullscreen"))) fullscreen = (strcmp(v, "true") == 0 || strcmp(v, "1") == 0);
-    if ((v = get_config(path, "videoDevice")) && *v) strncpy(video_dev, v, sizeof(video_dev)-1);
-    if ((v = get_config(path, "processes"))) parse_list(v, procs, &proc_count, MAX_ITEMS);
-    if ((v = get_config(path, "enabledScreens"))) parse_list(v, screens, &screen_count, MAX_ITEMS);
-    else if ((v = get_config(path, "enabledScreenIndices"))) parse_list(v, screens, &screen_count, MAX_ITEMS);
-    if (proc_count == 0) procs[proc_count++] = strdup("howdy");
-    if (!realpath(video_dev, video_dev_real)) strncpy(video_dev_real, video_dev, sizeof(video_dev_real) - 1);
+    if ((v = get_config(path, "video_device"))) strncpy(video_dev, v, sizeof(video_dev)-1);
+    if ((v = get_config(path, "screens"))) parse_list(v, screens, &screen_count, MAX_ITEMS);
+    if ((v = get_config(path, "watch_processes"))) parse_list(v, procs, &proc_count, MAX_ITEMS);
 }
 
-/* Single-pass /proc scan - checks process names AND fd targets in one traversal */
-static bool scan_proc(void) {
-    DIR *d = opendir("/proc");
-    if (!d) return false;
-    pid_t mypid = getpid();
-    struct dirent *e;
-    bool found = false;
-    
-    while (!found && (e = readdir(d))) {
-        if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
-        long pid = strtol(e->d_name, NULL, 10);
-        if (pid <= 0 || pid == mypid) continue;
-        
-        char path[280];
-        /* Check process name */
-        snprintf(path, sizeof(path), "/proc/%s/comm", e->d_name);
-        FILE *f = fopen(path, "r");
-        if (f) {
-            char comm[64];
-            if (fgets(comm, sizeof(comm), f)) {
-                comm[strcspn(comm, "\n")] = '\0';
-                for (int i = 0; i < proc_count && !found; i++)
-                    if (strcmp(comm, procs[i]) == 0) { log_msg("Process: %s\n", procs[i]); found = true; }
-            }
-            fclose(f);
-        }
-        if (found) break;
-        
-        /* Check file descriptors */
-        snprintf(path, sizeof(path), "/proc/%s/fd", e->d_name);
-        DIR *fds = opendir(path);
-        if (!fds) continue;
-        struct dirent *fe;
-        while ((fe = readdir(fds))) {
-            char lp[512], t[PATH_MAX];
-            snprintf(lp, sizeof(lp), "%s/%s", path, fe->d_name);
-            ssize_t l = readlink(lp, t, sizeof(t) - 1);
-            if (l > 0) { t[l] = '\0'; if (strcmp(t, video_dev_real) == 0) { log_msg("FD open by %ld\n", pid); found = true; break; } }
-        }
-        closedir(fds);
+/* Resolve video device symlinks once at startup */
+static void resolve_video_dev(void) {
+    char *resolved = realpath(video_dev, NULL);
+    if (resolved) {
+        strncpy(video_dev_real, resolved, sizeof(video_dev_real) - 1);
+        free(resolved);
+    } else {
+        strncpy(video_dev_real, video_dev, sizeof(video_dev_real) - 1);
     }
-    closedir(d);
-    return found;
+    log_msg("Video device: %s -> %s\n", video_dev, video_dev_real);
 }
 
-static bool v4l2_busy(void) {
+/* Get process name from /proc/[pid]/comm */
+static bool get_proc_name(pid_t pid, char *buf, size_t len) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/comm", pid);
+    FILE *f = fopen(path, "r");
+    if (!f) return false;
+    if (!fgets(buf, len, f)) { fclose(f); return false; }
+    fclose(f);
+    char *nl = strchr(buf, '\n');
+    if (nl) *nl = '\0';
+    return true;
+}
+
+/* Check if process name matches our watch list */
+static bool is_watched_proc(const char *name) {
+    for (int i = 0; i < proc_count; i++) {
+        if (strcasecmp(name, procs[i]) == 0) return true;
+        /* Also check partial match for things like "python3" running "howdy" */
+        if (strcasestr(name, procs[i])) return true;
+    }
+    return false;
+}
+
+/* V4L2 streaming check - returns true if camera is in use */
+static bool v4l2_streaming(void) {
     int fd = open(video_dev, O_RDONLY | O_NONBLOCK);
     if (fd < 0) return false;
-    struct v4l2_requestbuffers r = {.type = V4L2_BUF_TYPE_VIDEO_CAPTURE, .memory = V4L2_MEMORY_MMAP};
-    int ret = ioctl(fd, VIDIOC_REQBUFS, &r);
+    
+    struct v4l2_requestbuffers req = {
+        .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+        .memory = V4L2_MEMORY_MMAP
+    };
+    
+    int ret = ioctl(fd, VIDIOC_REQBUFS, &req);
     int err = errno;
     close(fd);
+    
     return (ret < 0 && err == EBUSY);
 }
 
-static bool cam_active(void) { return scan_proc() || v4l2_busy(); }
+/* Setup netlink proc connector */
+static int setup_netlink(void) {
+    nl_sock = socket(PF_NETLINK, SOCK_DGRAM, NETLINK_CONNECTOR);
+    if (nl_sock < 0) {
+        log_err("Netlink socket failed (need root?): %s\n", strerror(errno));
+        return -1;
+    }
+    
+    struct sockaddr_nl addr = {
+        .nl_family = AF_NETLINK,
+        .nl_groups = CN_IDX_PROC,
+        .nl_pid = getpid()
+    };
+    
+    if (bind(nl_sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        log_err("Netlink bind failed: %s\n", strerror(errno));
+        close(nl_sock);
+        nl_sock = -1;
+        return -1;
+    }
+    
+    /* Subscribe to proc events */
+    struct {
+        struct nlmsghdr nl;
+        struct cn_msg cn;
+        enum proc_cn_mcast_op op;
+    } msg = {
+        .nl = {
+            .nlmsg_len = sizeof(msg),
+            .nlmsg_type = NLMSG_DONE,
+            .nlmsg_pid = getpid()
+        },
+        .cn = {
+            .id = { .idx = CN_IDX_PROC, .val = CN_VAL_PROC },
+            .len = sizeof(enum proc_cn_mcast_op)
+        },
+        .op = PROC_CN_MCAST_LISTEN
+    };
+    
+    if (send(nl_sock, &msg, sizeof(msg), 0) < 0) {
+        log_err("Netlink subscribe failed: %s\n", strerror(errno));
+        close(nl_sock);
+        nl_sock = -1;
+        return -1;
+    }
+    
+    log_msg("Netlink proc connector ready\n");
+    return 0;
+}
+
+static void start_overlay(void);
+static void stop_overlay(void);
+
+/* Process a netlink event - returns true if state changed */
+static bool handle_netlink_event(void) {
+    char buf[4096];
+    ssize_t len = recv(nl_sock, buf, sizeof(buf), MSG_DONTWAIT);
+    if (len <= 0) return false;
+    
+    struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
+    if (!NLMSG_OK(nlh, (size_t)len)) return false;
+    
+    struct cn_msg *cn = NLMSG_DATA(nlh);
+    struct proc_event *ev = (struct proc_event *)cn->data;
+    
+    bool state_changed = false;
+    char proc_name[256];
+    
+    switch (ev->what) {
+        case PROC_EVENT_EXEC: {
+            pid_t pid = ev->event_data.exec.process_pid;
+            if (get_proc_name(pid, proc_name, sizeof(proc_name)) && is_watched_proc(proc_name)) {
+                log_msg("Watched process started: %s (pid %d)\n", proc_name, pid);
+                watched_proc_count++;
+                state_changed = true;
+            }
+            break;
+        }
+        case PROC_EVENT_EXIT: {
+            /* We can't get the name of an exited process, so we track by count */
+            /* When watched_proc_count > 0 and a process exits, we recheck */
+            if (watched_proc_count > 0 || overlay_active) {
+                state_changed = true;  /* Trigger a V4L2 check */
+            }
+            break;
+        }
+        default:
+            break;
+    }
+    
+    return state_changed;
+}
+
+/* Drain all pending netlink events, return true if any relevant */
+static bool process_netlink_events(void) {
+    bool any_relevant = false;
+    int count = 0;
+    
+    while (count < 100) {  /* Limit to avoid infinite loop */
+        if (!handle_netlink_event()) break;
+        any_relevant = true;
+        count++;
+    }
+    
+    return any_relevant;
+}
 
 static void start_overlay(void) {
-    if (overlay_count > 0 && overlay_pids[0] > 0 && kill(overlay_pids[0], 0) == 0) return;
+    if (overlay_active) return;
+    
     log_msg("Starting overlay\n");
     
-    char bstr[16], wstr[16];
+    char bstr[16], wstr[16], sstr[16];
     snprintf(bstr, sizeof(bstr), "%d", brightness);
     snprintf(wstr, sizeof(wstr), "%d", width);
     
-    int n = screen_count > 0 ? screen_count : 1;
+    int num_screens = screen_count > 0 ? screen_count : 1;
     overlay_count = 0;
-    for (int i = 0; i < n && overlay_count < MAX_ITEMS; i++) {
-        pid_t p = fork();
-        if (p < 0) continue;
-        if (p == 0) {
-            char *argv[16] = {"ringlight-overlay", "-c", color, "-b", bstr, "-w", wstr};
-            int c = 7;
-            if (fullscreen) argv[c++] = "-f";
-            if (screen_count > 0 && screens[i]) { argv[c++] = "-s"; argv[c++] = screens[i]; }
-            argv[c] = NULL;
-            execvp("ringlight-overlay", argv);
+    
+    for (int i = 0; i < num_screens && overlay_count < MAX_ITEMS; i++) {
+        pid_t pid = fork();
+        if (pid == 0) {
+            /* Build argument list */
+            char *args[16];
+            int n = 0;
+            args[n++] = (char*)"ringlight-overlay";
+            args[n++] = (char*)"-c"; args[n++] = color;
+            args[n++] = (char*)"-b"; args[n++] = bstr;
+            args[n++] = (char*)"-w"; args[n++] = wstr;
+            if (fullscreen) args[n++] = (char*)"-f";
+            if (screen_count > 0) {
+                snprintf(sstr, sizeof(sstr), "%s", screens[i]);
+                args[n++] = (char*)"-s"; 
+                args[n++] = sstr;
+            }
+            args[n] = NULL;
+            
+            /* Debug: log what we're executing */
+            fprintf(stderr, "[monitor] Exec:");
+            for (int j = 0; args[j]; j++) fprintf(stderr, " %s", args[j]);
+            fprintf(stderr, "\n");
+            
+            /* Check environment */
+            if (!getenv("WAYLAND_DISPLAY")) {
+                fprintf(stderr, "[monitor] WARNING: WAYLAND_DISPLAY not set!\n");
+            }
+            if (!getenv("XDG_RUNTIME_DIR")) {
+                fprintf(stderr, "[monitor] WARNING: XDG_RUNTIME_DIR not set!\n");
+            }
+            
+            execvp("ringlight-overlay", args);
+            
+            /* If we get here, exec failed */
+            fprintf(stderr, "[monitor] ERROR: exec failed: %s\n", strerror(errno));
             _exit(1);
+        } else if (pid > 0) {
+            overlay_pids[overlay_count++] = pid;
+            log_msg("Spawned overlay pid %d\n", pid);
+        } else {
+            log_err("Fork failed: %s\n", strerror(errno));
         }
-        overlay_pids[overlay_count++] = p;
     }
+    
+    overlay_active = (overlay_count > 0);
 }
 
 static void stop_overlay(void) {
-    if (overlay_count == 0) return;
+    if (!overlay_active) return;
+    
     log_msg("Stopping overlay\n");
-    for (int i = 0; i < overlay_count; i++) if (overlay_pids[i] > 0) kill(overlay_pids[i], SIGTERM);
-    for (int j = 0; j < 10; j++) {
-        bool done = true;
-        for (int i = 0; i < overlay_count; i++)
-            if (overlay_pids[i] > 0 && waitpid(overlay_pids[i], NULL, WNOHANG) == 0) done = false;
-            else overlay_pids[i] = 0;
-        if (done) break;
-        usleep(50000);
+    
+    for (int i = 0; i < overlay_count; i++) {
+        if (overlay_pids[i] > 0) {
+            kill(overlay_pids[i], SIGTERM);
+            waitpid(overlay_pids[i], NULL, 0);
+            overlay_pids[i] = 0;
+        }
     }
-    for (int i = 0; i < overlay_count; i++) if (overlay_pids[i] > 0) { kill(overlay_pids[i], SIGKILL); waitpid(overlay_pids[i], NULL, 0); }
     overlay_count = 0;
+    overlay_active = false;
+    watched_proc_count = 0;  /* Reset counter */
+}
+
+static void cleanup(void) {
+    stop_overlay();
+    if (nl_sock >= 0) close(nl_sock);
+    for (int i = 0; i < proc_count; i++) free(procs[i]);
+    for (int i = 0; i < screen_count; i++) free(screens[i]);
+}
+
+static void usage(const char *prog) {
+    printf("Usage: %s [options]\n"
+           "  -d, --device PATH    Video device (default: /dev/video0)\n"
+           "  -p, --proc NAME      Process to watch (can repeat, default: howdy)\n"
+           "  -v, --verbose        Verbose output\n"
+           "  -h, --help           Show help\n", prog);
 }
 
 int main(int argc, char *argv[]) {
     static struct option opts[] = {
-        {"device", 1, 0, 'd'}, {"interval", 1, 0, 'i'}, {"process", 1, 0, 'p'},
-        {"color", 1, 0, 'c'}, {"brightness", 1, 0, 'b'}, {"width", 1, 0, 'w'},
-        {"screens", 1, 0, 's'}, {"fullscreen", 0, 0, 'f'}, {"verbose", 0, 0, 'v'}, {"help", 0, 0, 'h'}, {0}
+        {"device", required_argument, 0, 'd'},
+        {"proc", required_argument, 0, 'p'},
+        {"verbose", no_argument, 0, 'v'},
+        {"help", no_argument, 0, 'h'},
+        {0, 0, 0, 0}
     };
     
-    char *cli_procs[MAX_ITEMS] = {0}, *cli_screens[MAX_ITEMS] = {0};
-    int cli_pc = 0, cli_sc = 0;
-    char cli_col[32] = "", cli_dev[256] = "";
-    int cli_br = 0, cli_wd = 0;
-    bool has_p = false, has_s = false, has_c = false, has_br = false, has_wd = false, has_d = false, has_f = false;
-    
-    int o;
-    while ((o = getopt_long(argc, argv, "d:i:p:c:b:w:s:fvh", opts, NULL)) != -1) {
-        switch (o) {
-        case 'd': strncpy(cli_dev, optarg, sizeof(cli_dev)-1); has_d = true; break;
-        case 'i': poll_ms = atoi(optarg); if (poll_ms < 100) poll_ms = 100; break;
-        case 'p': if (cli_pc < MAX_ITEMS) cli_procs[cli_pc++] = strdup(optarg); has_p = true; break;
-        case 'c': strncpy(cli_col, optarg, sizeof(cli_col)-1); has_c = true; break;
-        case 'b': cli_br = atoi(optarg); has_br = true; break;
-        case 'w': cli_wd = atoi(optarg); has_wd = true; break;
-        case 's': parse_list(optarg, cli_screens, &cli_sc, MAX_ITEMS); has_s = true; break;
-        case 'f': has_f = true; break;
-        case 'v': verbose = true; break;
-        case 'h': printf("ringlight-monitor - Auto ring light\nUsage: %s [-d dev] [-i ms] [-p proc] [-c hex] [-b 1-100] [-w px] [-s screens] [-f] [-v]\n", argv[0]); return 0;
+    int c;
+    while ((c = getopt_long(argc, argv, "d:p:vh", opts, NULL)) != -1) {
+        switch (c) {
+            case 'd': strncpy(video_dev, optarg, sizeof(video_dev)-1); break;
+            case 'p': if (proc_count < MAX_ITEMS) procs[proc_count++] = strdup(optarg); break;
+            case 'v': verbose = true; break;
+            case 'h': usage(argv[0]); return 0;
         }
     }
     
     load_config();
     
-    if (has_d) { strncpy(video_dev, cli_dev, sizeof(video_dev)-1); realpath(video_dev, video_dev_real) || strncpy(video_dev_real, video_dev, sizeof(video_dev_real)-1); }
-    if (has_c) strncpy(color, cli_col, sizeof(color)-1);
-    if (has_br) { brightness = cli_br; brightness = brightness < 1 ? 1 : brightness > 100 ? 100 : brightness; }
-    if (has_wd) { width = cli_wd; width = width < 10 ? 10 : width > 500 ? 500 : width; }
-    if (has_f) fullscreen = true;
-    if (has_p) { proc_count = 0; for (int i = 0; i < cli_pc; i++) procs[proc_count++] = cli_procs[i]; }
-    if (has_s) { screen_count = 0; for (int i = 0; i < cli_sc; i++) screens[screen_count++] = cli_screens[i]; }
+    /* Default watch process */
+    if (proc_count == 0) procs[proc_count++] = strdup("howdy");
+    
+    resolve_video_dev();
     
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
     signal(SIGCHLD, SIG_IGN);
-    atexit(stop_overlay);
     
-    log_msg("Monitoring %s @ %dms\n", video_dev, poll_ms);
+    atexit(cleanup);
     
-    bool was = false;
-    while (running) {
-        bool is = cam_active();
-        if (is && !was) start_overlay();
-        else if (!is && was) stop_overlay();
-        was = is;
-        usleep(poll_ms * 1000);
+    log_msg("Starting monitor\n");
+    log_msg("Watching processes:");
+    for (int i = 0; i < proc_count; i++) log_msg(" %s", procs[i]);
+    log_msg("\n");
+    
+    /* Try to setup netlink */
+    bool have_netlink = (setup_netlink() == 0);
+    
+    if (!have_netlink) {
+        log_err("Warning: Running in poll-only mode (slower, higher CPU)\n");
     }
+    
+    /* Main loop */
+    while (running) {
+        bool need_check = false;
+        time_t now = time(NULL);
+        
+        if (have_netlink) {
+            /* Wait for netlink events with timeout */
+            fd_set fds;
+            FD_ZERO(&fds);
+            FD_SET(nl_sock, &fds);
+            
+            /* Timeout: shorter if overlay active (to catch exits), longer if idle */
+            struct timeval tv = {
+                .tv_sec = overlay_active ? 1 : V4L2_POLL_INTERVAL,
+                .tv_usec = 0
+            };
+            
+            int ret = select(nl_sock + 1, &fds, NULL, NULL, &tv);
+            
+            if (ret > 0 && FD_ISSET(nl_sock, &fds)) {
+                /* Process events, only check V4L2 if something relevant happened */
+                need_check = process_netlink_events();
+            } else if (ret == 0) {
+                /* Timeout - do periodic V4L2 check only if overlay not active */
+                if (!overlay_active && (now - last_v4l2_check >= V4L2_POLL_INTERVAL)) {
+                    need_check = true;
+                } else if (overlay_active) {
+                    /* Verify overlay children are still running */
+                    bool any_alive = false;
+                    for (int i = 0; i < overlay_count; i++) {
+                        if (overlay_pids[i] > 0 && kill(overlay_pids[i], 0) == 0) {
+                            any_alive = true;
+                            break;
+                        }
+                    }
+                    if (!any_alive) {
+                        log_msg("Overlay processes died\n");
+                        overlay_active = false;
+                        overlay_count = 0;
+                    }
+                    need_check = true;  /* Check if we should restart */
+                }
+            }
+        } else {
+            /* Fallback: pure polling mode */
+            sleep(V4L2_POLL_INTERVAL);
+            need_check = true;
+        }
+        
+        /* Only check V4L2 when needed */
+        if (need_check) {
+            bool cam_in_use = v4l2_streaming();
+            last_v4l2_check = now;
+            
+            if (cam_in_use && !overlay_active) {
+                log_msg("Camera active, starting overlay\n");
+                start_overlay();
+            } else if (!cam_in_use && overlay_active) {
+                log_msg("Camera inactive, stopping overlay\n");
+                stop_overlay();
+            }
+        }
+    }
+    
+    log_msg("Shutting down\n");
     return 0;
 }

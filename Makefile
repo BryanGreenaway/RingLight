@@ -1,17 +1,12 @@
-# RingLight - Screen ring light for KDE Plasma 6
-
 BUILD_DIR = build
 PREFIX ?= /usr/local
 
-.PHONY: all clean install uninstall
+.PHONY: all clean install uninstall setcap
 
 all:
 	@mkdir -p $(BUILD_DIR)
 	@cd $(BUILD_DIR) && cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=$(PREFIX) ..
 	@cmake --build $(BUILD_DIR) -j$$(nproc)
-	@echo ""
-	@echo "Build complete:"
-	@ls -lh $(BUILD_DIR)/ringlight-overlay $(BUILD_DIR)/ringlight-gui $(BUILD_DIR)/ringlight-monitor
 
 clean:
 	rm -rf $(BUILD_DIR)
@@ -19,17 +14,24 @@ clean:
 install: all
 	@cmake --install $(BUILD_DIR)
 	@echo ""
-	@echo "Installed to $(PREFIX)"
+	@echo "Setting capabilities for event-driven monitoring..."
+	@if setcap cap_net_admin,cap_sys_admin+ep $(PREFIX)/bin/ringlight-monitor 2>/dev/null; then \
+		echo "  Capabilities set (zero-CPU event mode enabled)"; \
+	else \
+		echo "  Note: Could not set capabilities (need sudo for setcap)"; \
+		echo "  Run: sudo make setcap"; \
+		echo "  Or ringlight-monitor will use polling fallback"; \
+	fi
 	@echo ""
-	@echo "To start the GUI:"
-	@echo "  ringlight-gui"
-	@echo ""
-	@echo "Or enable auto-start at login:"
-	@echo "  systemctl --user enable ringlight-monitor"
+	@echo "Installation complete!"
+	@echo "  Start GUI:        ringlight-gui"
+	@echo "  Auto-start:       systemctl --user enable --now ringlight-monitor"
+
+setcap:
+	setcap cap_net_admin+ep $(PREFIX)/bin/ringlight-monitor
+	@echo "Capabilities set successfully"
 
 uninstall:
-	rm -f $(PREFIX)/bin/ringlight-overlay
-	rm -f $(PREFIX)/bin/ringlight-gui
-	rm -f $(PREFIX)/bin/ringlight-monitor
+	rm -f $(PREFIX)/bin/ringlight-overlay $(PREFIX)/bin/ringlight-gui $(PREFIX)/bin/ringlight-monitor
 	rm -f $(PREFIX)/lib/systemd/user/ringlight-monitor.service
 	rm -f $(PREFIX)/share/applications/ringlight.desktop
