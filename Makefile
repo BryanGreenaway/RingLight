@@ -1,37 +1,51 @@
-BUILD_DIR = build
 PREFIX ?= /usr/local
+BINDIR ?= $(PREFIX)/bin
+SYSTEMD_USER_DIR ?= $(HOME)/.config/systemd/user
 
-.PHONY: all clean install uninstall setcap
+CC ?= gcc
+CFLAGS ?= -O2 -Wall -Wextra
 
-all:
-	@mkdir -p $(BUILD_DIR)
-	@cd $(BUILD_DIR) && cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=$(PREFIX) ..
-	@cmake --build $(BUILD_DIR) -j$$(nproc)
+.PHONY: all clean install install-service uninstall gui monitor
+
+all: monitor gui
+
+monitor: ringlight-monitor
+
+gui: build/ringlight-gui build/ringlight-overlay
+
+ringlight-monitor: src/monitor.c
+	$(CC) $(CFLAGS) -o $@ $<
+	strip $@
+
+build/ringlight-gui build/ringlight-overlay: src/gui.cpp src/overlay.c CMakeLists.txt
+	@mkdir -p build
+	@cd build && cmake .. && make -j$$(nproc)
 
 clean:
-	rm -rf $(BUILD_DIR)
+	rm -rf build ringlight-monitor
 
 install: all
-	@cmake --install $(BUILD_DIR)
+	install -Dm755 ringlight-monitor $(DESTDIR)$(BINDIR)/ringlight-monitor
+	install -Dm755 ringlight-monitor-wrapper $(DESTDIR)$(BINDIR)/ringlight-monitor-wrapper
+	@if [ -f build/ringlight-gui ]; then install -Dm755 build/ringlight-gui $(DESTDIR)$(BINDIR)/ringlight-gui; fi
+	@if [ -f build/ringlight-overlay ]; then install -Dm755 build/ringlight-overlay $(DESTDIR)$(BINDIR)/ringlight-overlay; fi
 	@echo ""
-	@echo "Setting capabilities for event-driven monitoring..."
-	@if setcap cap_net_admin,cap_sys_admin+ep $(PREFIX)/bin/ringlight-monitor 2>/dev/null; then \
-		echo "  Capabilities set (zero-CPU event mode enabled)"; \
-	else \
-		echo "  Note: Could not set capabilities (need sudo for setcap)"; \
-		echo "  Run: sudo make setcap"; \
-		echo "  Or ringlight-monitor will use polling fallback"; \
-	fi
-	@echo ""
-	@echo "Installation complete!"
-	@echo "  Start GUI:        ringlight-gui"
-	@echo "  Auto-start:       systemctl --user enable --now ringlight-monitor"
+	@echo "Setting CAP_NET_ADMIN capability for process monitoring..."
+	-setcap cap_net_admin+ep $(DESTDIR)$(BINDIR)/ringlight-monitor 2>/dev/null || \
+		echo "WARNING: Could not set capability. Run: sudo setcap cap_net_admin+ep $(BINDIR)/ringlight-monitor"
 
-setcap:
-	setcap cap_net_admin+ep $(PREFIX)/bin/ringlight-monitor
-	@echo "Capabilities set successfully"
+install-service:
+	mkdir -p $(SYSTEMD_USER_DIR)
+	install -Dm644 ringlight-monitor.service $(SYSTEMD_USER_DIR)/ringlight-monitor.service
+	@echo ""
+	@echo "Service installed. To enable:"
+	@echo "  systemctl --user daemon-reload"
+	@echo "  systemctl --user enable --now ringlight-monitor"
 
 uninstall:
-	rm -f $(PREFIX)/bin/ringlight-overlay $(PREFIX)/bin/ringlight-gui $(PREFIX)/bin/ringlight-monitor
-	rm -f $(PREFIX)/lib/systemd/user/ringlight-monitor.service
-	rm -f $(PREFIX)/share/applications/ringlight.desktop
+	rm -f $(DESTDIR)$(BINDIR)/ringlight-monitor
+	rm -f $(DESTDIR)$(BINDIR)/ringlight-monitor-wrapper
+	rm -f $(DESTDIR)$(BINDIR)/ringlight-gui
+	rm -f $(DESTDIR)$(BINDIR)/ringlight-overlay
+	rm -f $(SYSTEMD_USER_DIR)/ringlight-monitor.service
+	-systemctl --user disable ringlight-monitor 2>/dev/null

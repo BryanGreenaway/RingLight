@@ -1,0 +1,43 @@
+#!/bin/bash
+# ringlight-monitor-wrapper
+# Wrapper to run ringlight-monitor with Wayland session environment
+
+# If already set, just run
+if [[ -n "$WAYLAND_DISPLAY" && -n "$XDG_RUNTIME_DIR" ]]; then
+    exec /usr/local/bin/ringlight-monitor "$@"
+fi
+
+# Try to get from a running KDE/Plasma/Wayland process
+get_env_from_proc() {
+    local proc_name="$1"
+    local pid
+    pid=$(pgrep -u "$USER" -x "$proc_name" | head -1)
+    if [[ -n "$pid" && -r "/proc/$pid/environ" ]]; then
+        while IFS='=' read -r -d '' key value; do
+            case "$key" in
+                WAYLAND_DISPLAY|XDG_RUNTIME_DIR|DISPLAY)
+                    export "$key=$value"
+                    ;;
+            esac
+        done < "/proc/$pid/environ"
+        return 0
+    fi
+    return 1
+}
+
+for proc in kwin_wayland plasmashell kded6 kded5 gnome-shell sway Hyprland; do
+    if get_env_from_proc "$proc"; then
+        break
+    fi
+done
+
+if [[ -z "$WAYLAND_DISPLAY" ]]; then
+    echo "[ringlight-monitor-wrapper] ERROR: Could not find WAYLAND_DISPLAY" >&2
+    exit 1
+fi
+
+if [[ -z "$XDG_RUNTIME_DIR" ]]; then
+    export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+fi
+
+exec /usr/local/bin/ringlight-monitor "$@"

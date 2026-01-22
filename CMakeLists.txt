@@ -1,81 +1,64 @@
 cmake_minimum_required(VERSION 3.16)
-project(ringlight VERSION 1.0 LANGUAGES CXX C)
+project(ringlight VERSION 1.0)
 
+set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
 
+# Find packages
 find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets)
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(WAYLAND_CLIENT REQUIRED wayland-client)
+pkg_check_modules(WAYLAND REQUIRED wayland-client)
 
-find_program(WAYLAND_SCANNER wayland-scanner REQUIRED)
-
-pkg_get_variable(WAYLAND_PROTOCOLS_DIR wayland-protocols pkgdatadir)
-if(NOT WAYLAND_PROTOCOLS_DIR)
-    if(EXISTS "/usr/share/wayland-protocols")
-        set(WAYLAND_PROTOCOLS_DIR "/usr/share/wayland-protocols")
-    else()
-        message(FATAL_ERROR "wayland-protocols not found")
-    endif()
+# Find wayland-scanner
+find_program(WAYLAND_SCANNER wayland-scanner)
+if(NOT WAYLAND_SCANNER)
+    message(FATAL_ERROR "wayland-scanner not found")
 endif()
 
-set(PROTOCOL_DIR ${CMAKE_SOURCE_DIR}/protocol)
-set(GENERATED_DIR ${CMAKE_BINARY_DIR}/generated)
-file(MAKE_DIRECTORY ${GENERATED_DIR})
+# Protocol paths
+pkg_get_variable(WL_PROTOCOL_DIR wayland-protocols pkgdatadir)
+set(WLR_PROTOCOLS_DIR "${CMAKE_SOURCE_DIR}/protocols")
 
-set(XDG_SHELL_XML ${WAYLAND_PROTOCOLS_DIR}/stable/xdg-shell/xdg-shell.xml)
-set(XDG_SHELL_CLIENT_H ${GENERATED_DIR}/xdg-shell-client.h)
-set(XDG_SHELL_CODE_C ${GENERATED_DIR}/xdg-shell-code.c)
+# Generate protocol sources
+set(PROTO_BUILD_DIR "${CMAKE_BINARY_DIR}/protocols")
+file(MAKE_DIRECTORY ${PROTO_BUILD_DIR})
 
-add_custom_command(OUTPUT ${XDG_SHELL_CLIENT_H}
-    COMMAND ${WAYLAND_SCANNER} client-header ${XDG_SHELL_XML} ${XDG_SHELL_CLIENT_H}
-    DEPENDS ${XDG_SHELL_XML})
+# xdg-shell protocol
+set(XDG_SHELL_XML "${WL_PROTOCOL_DIR}/stable/xdg-shell/xdg-shell.xml")
+set(XDG_SHELL_C "${PROTO_BUILD_DIR}/xdg-shell-client.c")
+set(XDG_SHELL_H "${PROTO_BUILD_DIR}/xdg-shell-client.h")
+add_custom_command(
+    OUTPUT ${XDG_SHELL_C} ${XDG_SHELL_H}
+    COMMAND ${WAYLAND_SCANNER} client-header ${XDG_SHELL_XML} ${XDG_SHELL_H}
+    COMMAND ${WAYLAND_SCANNER} private-code ${XDG_SHELL_XML} ${XDG_SHELL_C}
+    DEPENDS ${XDG_SHELL_XML}
+)
 
-add_custom_command(OUTPUT ${XDG_SHELL_CODE_C}
-    COMMAND ${WAYLAND_SCANNER} private-code ${XDG_SHELL_XML} ${XDG_SHELL_CODE_C}
-    DEPENDS ${XDG_SHELL_XML})
+# wlr-layer-shell protocol (bundled)
+set(LAYER_SHELL_XML "${WLR_PROTOCOLS_DIR}/wlr-layer-shell-unstable-v1.xml")
+set(LAYER_SHELL_C "${PROTO_BUILD_DIR}/wlr-layer-shell-unstable-v1-client.c")
+set(LAYER_SHELL_H "${PROTO_BUILD_DIR}/wlr-layer-shell-unstable-v1-client.h")
+add_custom_command(
+    OUTPUT ${LAYER_SHELL_C} ${LAYER_SHELL_H}
+    COMMAND ${WAYLAND_SCANNER} client-header ${LAYER_SHELL_XML} ${LAYER_SHELL_H}
+    COMMAND ${WAYLAND_SCANNER} private-code ${LAYER_SHELL_XML} ${LAYER_SHELL_C}
+    DEPENDS ${LAYER_SHELL_XML}
+)
 
-set(LAYER_SHELL_XML ${PROTOCOL_DIR}/wlr-layer-shell-unstable-v1.xml)
-set(LAYER_SHELL_CLIENT_H ${GENERATED_DIR}/wlr-layer-shell-unstable-v1-client.h)
-set(LAYER_SHELL_CODE_C ${GENERATED_DIR}/wlr-layer-shell-unstable-v1-code.c)
+# Overlay (C with Wayland)
+add_executable(ringlight-overlay
+    src/overlay.c
+    ${XDG_SHELL_C}
+    ${LAYER_SHELL_C}
+)
+target_include_directories(ringlight-overlay PRIVATE ${PROTO_BUILD_DIR} ${WAYLAND_INCLUDE_DIRS})
+target_link_libraries(ringlight-overlay PRIVATE ${WAYLAND_LIBRARIES} rt)
 
-add_custom_command(OUTPUT ${LAYER_SHELL_CLIENT_H}
-    COMMAND ${WAYLAND_SCANNER} client-header ${LAYER_SHELL_XML} ${LAYER_SHELL_CLIENT_H}
-    DEPENDS ${LAYER_SHELL_XML})
-
-add_custom_command(OUTPUT ${LAYER_SHELL_CODE_C}
-    COMMAND ${WAYLAND_SCANNER} private-code ${LAYER_SHELL_XML} ${LAYER_SHELL_CODE_C}
-    DEPENDS ${LAYER_SHELL_XML} ${XDG_SHELL_CLIENT_H})
-
-add_custom_target(wayland_protocols DEPENDS 
-    ${XDG_SHELL_CLIENT_H} ${XDG_SHELL_CODE_C}
-    ${LAYER_SHELL_CLIENT_H} ${LAYER_SHELL_CODE_C})
-
-# Overlay
-add_executable(ringlight-overlay src/overlay.c ${XDG_SHELL_CODE_C} ${LAYER_SHELL_CODE_C})
-add_dependencies(ringlight-overlay wayland_protocols)
-target_include_directories(ringlight-overlay PRIVATE ${GENERATED_DIR} ${WAYLAND_CLIENT_INCLUDE_DIRS})
-target_link_libraries(ringlight-overlay PRIVATE ${WAYLAND_CLIENT_LIBRARIES} rt)
-target_compile_options(ringlight-overlay PRIVATE ${WAYLAND_CLIENT_CFLAGS_OTHER})
-
-# GUI
+# GUI (C++ with Qt)
 add_executable(ringlight-gui src/gui.cpp)
 target_link_libraries(ringlight-gui PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets)
 
-# Monitor
-add_executable(ringlight-monitor src/monitor.c)
-
 # Install
-include(GNUInstallDirs)
-install(TARGETS ringlight-overlay ringlight-gui ringlight-monitor RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
-
-# Systemd user service - goes to /usr/lib/systemd/user or similar
-if(CMAKE_INSTALL_PREFIX STREQUAL "/usr")
-    set(SYSTEMD_USER_DIR "/usr/lib/systemd/user")
-else()
-    set(SYSTEMD_USER_DIR "${CMAKE_INSTALL_PREFIX}/lib/systemd/user")
-endif()
-install(FILES systemd/ringlight-monitor.service DESTINATION ${SYSTEMD_USER_DIR})
-
-install(FILES resources/ringlight.desktop DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/applications)
+install(TARGETS ringlight-overlay ringlight-gui RUNTIME DESTINATION bin)
