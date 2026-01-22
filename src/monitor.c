@@ -164,15 +164,18 @@ static void add_watched_pid(pid_t pid) {
     if (watched_pid_count >= MAX_ITEMS) return;
     for (int i = 0; i < watched_pid_count; i++) if (watched_pids[i] == pid) return;
     watched_pids[watched_pid_count++] = pid;
+    log_msg("Tracking pid %d (total: %d)\n", pid, watched_pid_count);
 }
 
-static void remove_watched_pid(pid_t pid) {
+static bool remove_watched_pid(pid_t pid) {
     for (int i = 0; i < watched_pid_count; i++) {
         if (watched_pids[i] == pid) {
             watched_pids[i] = watched_pids[--watched_pid_count];
-            return;
+            log_msg("Untracked pid %d (remaining: %d)\n", pid, watched_pid_count);
+            return true;
         }
     }
+    return false;
 }
 
 static int setup_netlink(void) {
@@ -275,21 +278,31 @@ static void cleanup(void) {
     for (int i = 0; i < screen_count; i++) free(screens[i]);
 }
 
-static void run_process_mode(void) {
-    log_msg("Process mode: watching");
-    for (int i = 0; i < watch_proc_count; i++) log_msg(" %s", watch_procs[i]);
-    log_msg("\n");
+/* Check if a PID is still alive */
+static bool pid_alive(pid_t pid) {
+    return kill(pid, 0) == 0;
+}
+
+/* Verify watched PIDs are still running, remove dead ones */
+static void verify_watched_pids(void) {
+    int i = 0;
+    while (i < watched_pid_count) {
+        if (!pid_alive(watched_pids[i])) {
+            log_msg("Process died: pid %d\n", watched_pids[i]);
+            watched_pids[i] = watched_pids[--watched_pid_count];
+        } else {
+            i++;
+        }
+    }
+}
+
+/* Process all netlink messages in buffer */
+static void process_netlink_events(char *buf, ssize_t len) {
+    struct nlmsghdr *nlh;
     
-    char buf[4096];
-    while (running) {
-        struct pollfd pfd = { .fd = nl_sock, .events = POLLIN };
-        if (poll(&pfd, 1, -1) <= 0) continue;
-        
-        ssize_t len = recv(nl_sock, buf, sizeof(buf), MSG_DONTWAIT);
-        if (len <= 0) continue;
-        
-        struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
-        if (!NLMSG_OK(nlh, (size_t)len)) continue;
+    for (nlh = (struct nlmsghdr *)buf; NLMSG_OK(nlh, (size_t)len); nlh = NLMSG_NEXT(nlh, len)) {
+        if (nlh->nlmsg_type == NLMSG_DONE || nlh->nlmsg_type == NLMSG_ERROR)
+            continue;
         
         struct cn_msg *cn = NLMSG_DATA(nlh);
         struct proc_event *ev = (struct proc_event *)cn->data;
@@ -303,8 +316,42 @@ static void run_process_mode(void) {
             }
         } else if (ev->what == PROC_EVENT_EXIT) {
             pid_t pid = ev->event_data.exit.process_pid;
-            remove_watched_pid(pid);
-            if (watched_pid_count == 0 && overlay_active) stop_overlay();
+            if (watched_pid_count > 0) {
+                remove_watched_pid(pid);
+                if (watched_pid_count == 0 && overlay_active) {
+                    log_msg("All watched processes exited\n");
+                    stop_overlay();
+                }
+            }
+        }
+    }
+}
+
+static void run_process_mode(void) {
+    log_msg("Process mode: watching");
+    for (int i = 0; i < watch_proc_count; i++) log_msg(" %s", watch_procs[i]);
+    log_msg("\n");
+    
+    char buf[8192];
+    while (running) {
+        struct pollfd pfd = { .fd = nl_sock, .events = POLLIN };
+        /* Timeout every 500ms to verify PIDs are still alive */
+        int ret = poll(&pfd, 1, overlay_active ? 500 : -1);
+        
+        if (ret > 0 && (pfd.revents & POLLIN)) {
+            ssize_t len = recv(nl_sock, buf, sizeof(buf), MSG_DONTWAIT);
+            if (len > 0) {
+                process_netlink_events(buf, len);
+            }
+        }
+        
+        /* Safety check: verify watched processes are still running */
+        if (overlay_active && watched_pid_count > 0) {
+            verify_watched_pids();
+            if (watched_pid_count == 0) {
+                log_msg("No watched processes remaining\n");
+                stop_overlay();
+            }
         }
     }
 }

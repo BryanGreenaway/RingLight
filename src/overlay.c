@@ -21,6 +21,7 @@
 #include <limits.h>
 #include <pwd.h>
 #include <time.h>
+#include <poll.h>
 
 #include <wayland-client.h>
 #include "xdg-shell-client.h"
@@ -597,9 +598,30 @@ int main(int argc, char *argv[]) {
         if (all_done) break;
     }
     
-    /* Main loop */
+    /* Main loop - use poll with timeout to check running flag */
+    int wl_fd = wl_display_get_fd(wl_display);
     while (running) {
-        if (wl_display_dispatch(wl_display) < 0) break;
+        /* Flush pending requests */
+        while (wl_display_prepare_read(wl_display) != 0)
+            wl_display_dispatch_pending(wl_display);
+        wl_display_flush(wl_display);
+        
+        /* Poll with 100ms timeout to check running flag */
+        struct pollfd pfd = { .fd = wl_fd, .events = POLLIN };
+        int ret = poll(&pfd, 1, 100);
+        
+        if (ret < 0) {
+            wl_display_cancel_read(wl_display);
+            if (errno == EINTR) continue;  /* Signal received */
+            break;
+        }
+        
+        if (ret > 0 && (pfd.revents & POLLIN)) {
+            wl_display_read_events(wl_display);
+            wl_display_dispatch_pending(wl_display);
+        } else {
+            wl_display_cancel_read(wl_display);
+        }
     }
     
     /* Cleanup */
