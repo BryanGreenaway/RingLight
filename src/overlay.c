@@ -1,9 +1,11 @@
 /*
  * RingLight Overlay - Pure Wayland layer-shell overlay
  * 
- * Uses wlr-layer-shell protocol directly for proper multi-monitor support.
+ * Uses wlr-layer-shell protocol for multi-monitor support.
  * Click anywhere on the overlay to close.
- * License: MIT
+ * 
+ * Copyright (C) 2024-2025 Bryan
+ * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
 #define _GNU_SOURCE
@@ -27,8 +29,7 @@
 #include "xdg-shell-client.h"
 #include "wlr-layer-shell-unstable-v1-client.h"
 
-/* ========== Configuration ========== */
-
+/* Configuration */
 static int cfg_border_width = 80;
 static int cfg_brightness = 100;
 static uint32_t cfg_color = 0xFFFFFF;
@@ -37,8 +38,7 @@ static char cfg_target_name[64] = "";
 static bool cfg_list_only = false;
 static bool cfg_verbose = false;
 
-/* ========== Wayland State ========== */
-
+/* Wayland State */
 static struct wl_display *wl_display;
 static struct wl_registry *wl_registry;
 static struct wl_compositor *wl_compositor;
@@ -49,8 +49,7 @@ static struct zwlr_layer_shell_v1 *layer_shell;
 
 static volatile sig_atomic_t running = 1;
 
-/* ========== Output Tracking ========== */
-
+/* Output Tracking */
 #define MAX_OUTPUTS 8
 
 typedef struct {
@@ -65,8 +64,7 @@ typedef struct {
 static output_t outputs[MAX_OUTPUTS];
 static int num_outputs = 0;
 
-/* ========== Panel (Layer Surface) ========== */
-
+/* Panel (Layer Surface) */
 typedef struct {
     struct wl_surface *wl_surface;
     struct zwlr_layer_surface_v1 *layer_surface;
@@ -82,10 +80,9 @@ static panel_t *panels[MAX_PANELS];
 static int num_panels = 0;
 static struct wl_surface *pointer_surface;
 
-/* ========== Helpers ========== */
-
+/* Helpers */
 #define LOG(...) do { if (cfg_verbose) fprintf(stderr, "[ringlight] " __VA_ARGS__); } while(0)
-#define ERR(...) fprintf(stderr, "[ringlight] ERROR: " __VA_ARGS__)
+#define ERR(...) fprintf(stderr, "[ringlight] " __VA_ARGS__)
 
 static void sig_handler(int sig) { (void)sig; running = 0; }
 
@@ -175,8 +172,7 @@ static void destroy_panel_buffer(panel_t *panel) {
     if (panel->buffer_data) { munmap(panel->buffer_data, panel->buffer_size); panel->buffer_data = NULL; }
 }
 
-/* ========== Pointer Callbacks ========== */
-
+/* Pointer Callbacks */
 static void pointer_enter(void *data, struct wl_pointer *p, uint32_t serial,
                          struct wl_surface *surface, wl_fixed_t sx, wl_fixed_t sy) {
     (void)data; (void)p; (void)serial; (void)sx; (void)sy;
@@ -195,14 +191,13 @@ static void pointer_button(void *data, struct wl_pointer *p, uint32_t serial,
     
     for (int i = 0; i < num_panels; i++) {
         if (panels[i] && panels[i]->wl_surface == pointer_surface) {
-            LOG("Click on panel %d - quitting\n", i);
+            LOG("Click detected - exiting\n");
             running = 0;
             return;
         }
     }
 }
 
-/* Unused but required by listener */
 static void pointer_motion(void *d, struct wl_pointer *p, uint32_t t, wl_fixed_t x, wl_fixed_t y) { (void)d; (void)p; (void)t; (void)x; (void)y; }
 static void pointer_axis(void *d, struct wl_pointer *p, uint32_t t, uint32_t a, wl_fixed_t v) { (void)d; (void)p; (void)t; (void)a; (void)v; }
 static void pointer_frame(void *d, struct wl_pointer *p) { (void)d; (void)p; }
@@ -217,8 +212,7 @@ static const struct wl_pointer_listener pointer_listener = {
     .axis_discrete = pointer_axis_discrete,
 };
 
-/* ========== Seat Callbacks ========== */
-
+/* Seat Callbacks */
 static void seat_capabilities(void *data, struct wl_seat *seat, uint32_t caps) {
     (void)data;
     if ((caps & WL_SEAT_CAPABILITY_POINTER) && !wl_pointer) {
@@ -237,8 +231,7 @@ static const struct wl_seat_listener seat_listener = {
     .name = seat_name,
 };
 
-/* ========== Layer Surface Callbacks ========== */
-
+/* Layer Surface Callbacks */
 static void layer_configure(void *data, struct zwlr_layer_surface_v1 *surface,
                            uint32_t serial, uint32_t width, uint32_t height) {
     panel_t *panel = data;
@@ -271,8 +264,7 @@ static const struct zwlr_layer_surface_v1_listener layer_listener = {
     .closed = layer_closed,
 };
 
-/* ========== Output Callbacks ========== */
-
+/* Output Callbacks */
 static output_t *find_output(struct wl_output *wl) {
     for (int i = 0; i < num_outputs; i++)
         if (outputs[i].wl_output == wl) return &outputs[i];
@@ -319,8 +311,7 @@ static const struct wl_output_listener output_listener = {
     .scale = output_scale, .name = output_name, .description = output_desc,
 };
 
-/* ========== Registry Callbacks ========== */
-
+/* Registry Callbacks */
 static void registry_global(void *data, struct wl_registry *reg, uint32_t name,
                            const char *iface, uint32_t ver) {
     (void)data;
@@ -353,8 +344,7 @@ static const struct wl_registry_listener registry_listener = {
     .global_remove = registry_remove,
 };
 
-/* ========== Panel Creation ========== */
-
+/* Panel Creation */
 static panel_t *create_panel(output_t *output, uint32_t anchor, uint32_t w, uint32_t h) {
     panel_t *panel = calloc(1, sizeof(panel_t));
     if (!panel) return NULL;
@@ -394,8 +384,7 @@ static void destroy_panel(panel_t *panel) {
     free(panel);
 }
 
-/* ========== Config Loading ========== */
-
+/* Config Loading */
 static char *get_config_value(const char *path, const char *key) {
     FILE *f = fopen(path, "r");
     if (!f) return NULL;
@@ -409,7 +398,6 @@ static char *get_config_value(const char *path, const char *key) {
         char *eq = strchr(line, '=');
         if (!eq) continue;
         
-        /* Trim key */
         char *k = line;
         while (*k == ' ' || *k == '\t') k++;
         char *kend = eq;
@@ -417,14 +405,12 @@ static char *get_config_value(const char *path, const char *key) {
         
         if ((size_t)(kend - k) != keylen || strncmp(k, key, keylen) != 0) continue;
         
-        /* Trim value */
         char *v = eq + 1;
         while (*v == ' ' || *v == '\t') v++;
         char *vend = v + strlen(v);
         while (vend > v && (*(vend-1) == '\n' || *(vend-1) == '\r' || *(vend-1) == ' ')) vend--;
         *vend = '\0';
         
-        /* Strip quotes */
         if (vend - v >= 2 && v[0] == '"' && *(vend-1) == '"') {
             v++;
             *(vend-1) = '\0';
@@ -469,8 +455,7 @@ static void load_config(void) {
     }
 }
 
-/* ========== Main ========== */
-
+/* Main */
 static void print_usage(const char *prog) {
     printf("ringlight-overlay - Screen ring light for Wayland\n\n");
     printf("Usage: %s [options]\n\n", prog);
@@ -563,8 +548,8 @@ int main(int argc, char *argv[]) {
         target = &outputs[0];
     }
     
-    printf("%s on %s (%dx%d)\n", cfg_fullscreen ? "Fullscreen" : "Ring",
-           target->name, target->width, target->height);
+    LOG("Overlay on %s (%dx%d), %s mode\n", target->name, target->width, target->height,
+        cfg_fullscreen ? "fullscreen" : "ring");
     
     /* Create panels */
     if (cfg_fullscreen) {
@@ -598,21 +583,19 @@ int main(int argc, char *argv[]) {
         if (all_done) break;
     }
     
-    /* Main loop - use poll with timeout to check running flag */
+    /* Main loop */
     int wl_fd = wl_display_get_fd(wl_display);
     while (running) {
-        /* Flush pending requests */
         while (wl_display_prepare_read(wl_display) != 0)
             wl_display_dispatch_pending(wl_display);
         wl_display_flush(wl_display);
         
-        /* Poll with 100ms timeout to check running flag */
         struct pollfd pfd = { .fd = wl_fd, .events = POLLIN };
         int ret = poll(&pfd, 1, 100);
         
         if (ret < 0) {
             wl_display_cancel_read(wl_display);
-            if (errno == EINTR) continue;  /* Signal received */
+            if (errno == EINTR) continue;
             break;
         }
         

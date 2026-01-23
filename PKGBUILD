@@ -5,14 +5,11 @@ pkgrel=1
 pkgdesc="Screen ring light for KDE Plasma 6 / Wayland with Howdy integration"
 arch=('x86_64')
 url="https://github.com/yourusername/ringlight"
-license=('MIT')
+license=('GPL-3.0-or-later')
 depends=('qt6-base' 'wayland')
 makedepends=('cmake' 'wayland-protocols' 'pkgconf')
 optdepends=('howdy: Face recognition authentication')
 install=ringlight.install
-# For AUR releases, use:
-# source=("$pkgname-$pkgver.tar.gz::https://github.com/yourusername/ringlight/archive/v$pkgver.tar.gz")
-# For local builds:
 source=()
 sha256sums=()
 
@@ -38,10 +35,6 @@ package() {
     fi
     
     DESTDIR="$pkgdir" cmake --install build
-    
-    # Install license
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
-    
-    # Install documentation
     install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
 }

@@ -1,12 +1,11 @@
 /*
  * RingLight Monitor - Event-driven webcam activity detector
- * 
- * Modes:
- *   process - Watch for specific processes (howdy). Pure event-driven, no polling.
- *   camera  - Watch for any camera activity via V4L2 polling.
- *   hybrid  - Both process watching and camera polling.
- * 
- * License: MIT
+ *
+ * Watches for specific processes (like howdy) via netlink proc connector,
+ * or polls for camera activity via V4L2, and launches the overlay.
+ *
+ * Copyright (C) 2024-2025 Bryan
+ * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
 #define _GNU_SOURCE
@@ -20,7 +19,6 @@
 #include <getopt.h>
 #include <stdbool.h>
 #include <ctype.h>
-#include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
@@ -41,7 +39,7 @@ static pid_t overlay_pids[MAX_ITEMS];
 static int overlay_count = 0;
 static bool verbose = false;
 
-/* Config */
+/* Configuration */
 static enum monitor_mode mode = MODE_PROCESS;
 static char video_dev[256] = "/dev/video0";
 static char color[32] = "FFFFFF";
@@ -61,8 +59,8 @@ static bool overlay_active = false;
 
 static void sig_handler(int s) { (void)s; running = 0; }
 
-#define log_msg(...) do { if (verbose) { fprintf(stderr, "[monitor] " __VA_ARGS__); fflush(stderr); } } while(0)
-#define log_err(...) do { fprintf(stderr, "[monitor] ERROR: " __VA_ARGS__); fflush(stderr); } while(0)
+#define log_info(...) do { if (verbose) fprintf(stderr, "[ringlight] " __VA_ARGS__); } while(0)
+#define log_err(...) fprintf(stderr, "[ringlight] " __VA_ARGS__)
 
 static char *trim(char *s) {
     while (*s && isspace(*s)) s++;
@@ -89,23 +87,23 @@ static void load_config(void) {
     const char *home = getenv("HOME");
     if (!home) { struct passwd *pw = getpwuid(getuid()); if (pw) home = pw->pw_dir; }
     if (!home) return;
-    
+
     char path[PATH_MAX];
     snprintf(path, sizeof(path), "%s/.config/ringlight/config.ini", home);
-    
+
     FILE *f = fopen(path, "r");
     if (!f) return;
-    
+
     char line[512];
     while (fgets(line, sizeof(line), f)) {
         if (line[0] == '#' || line[0] == ';' || line[0] == '[') continue;
         char *eq = strchr(line, '=');
         if (!eq) continue;
-        
+
         *eq = '\0';
         char *key = trim(line);
         char *val = trim(eq + 1);
-        
+
         if (strcmp(key, "mode") == 0) {
             if (strcmp(val, "process") == 0) mode = MODE_PROCESS;
             else if (strcmp(val, "camera") == 0) mode = MODE_CAMERA;
@@ -149,13 +147,15 @@ static bool get_proc_cmdline(pid_t pid, char *buf, size_t len) {
 }
 
 static bool matches_watch_list(pid_t pid) {
-    char comm[256], cmdline[1024];
-    if (!get_proc_comm(pid, comm, sizeof(comm))) return false;
-    get_proc_cmdline(pid, cmdline, sizeof(cmdline));
-    
+    char comm[256] = {0}, cmdline[1024] = {0};
+    bool got_comm = get_proc_comm(pid, comm, sizeof(comm));
+    bool got_cmdline = get_proc_cmdline(pid, cmdline, sizeof(cmdline));
+
+    if (!got_comm && !got_cmdline) return false;
+
     for (int i = 0; i < watch_proc_count; i++) {
-        if (strcasecmp(comm, watch_procs[i]) == 0) return true;
-        if (strcasestr(cmdline, watch_procs[i])) return true;
+        if (got_comm && strcasecmp(comm, watch_procs[i]) == 0) return true;
+        if (got_cmdline && strcasestr(cmdline, watch_procs[i])) return true;
     }
     return false;
 }
@@ -164,18 +164,17 @@ static void add_watched_pid(pid_t pid) {
     if (watched_pid_count >= MAX_ITEMS) return;
     for (int i = 0; i < watched_pid_count; i++) if (watched_pids[i] == pid) return;
     watched_pids[watched_pid_count++] = pid;
-    log_msg("Tracking pid %d (total: %d)\n", pid, watched_pid_count);
+    log_info("Tracking pid %d\n", pid);
 }
 
-static bool remove_watched_pid(pid_t pid) {
+static void remove_watched_pid(pid_t pid) {
     for (int i = 0; i < watched_pid_count; i++) {
         if (watched_pids[i] == pid) {
             watched_pids[i] = watched_pids[--watched_pid_count];
-            log_msg("Untracked pid %d (remaining: %d)\n", pid, watched_pid_count);
-            return true;
+            log_info("Untracked pid %d\n", pid);
+            return;
         }
     }
-    return false;
 }
 
 static int setup_netlink(void) {
@@ -184,14 +183,14 @@ static int setup_netlink(void) {
         log_err("Netlink socket failed (need CAP_NET_ADMIN): %s\n", strerror(errno));
         return -1;
     }
-    
+
     struct sockaddr_nl addr = { .nl_family = AF_NETLINK, .nl_groups = CN_IDX_PROC, .nl_pid = getpid() };
     if (bind(nl_sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         log_err("Netlink bind failed: %s\n", strerror(errno));
         close(nl_sock); nl_sock = -1;
         return -1;
     }
-    
+
     struct {
         struct nlmsghdr nl;
         struct cn_msg cn;
@@ -201,14 +200,13 @@ static int setup_netlink(void) {
         .cn = { .id = { .idx = CN_IDX_PROC, .val = CN_VAL_PROC }, .len = sizeof(enum proc_cn_mcast_op) },
         .op = PROC_CN_MCAST_LISTEN
     };
-    
+
     if (send(nl_sock, &msg, sizeof(msg), 0) < 0) {
         log_err("Netlink subscribe failed: %s\n", strerror(errno));
         close(nl_sock); nl_sock = -1;
         return -1;
     }
-    
-    log_msg("Netlink ready\n");
+
     return 0;
 }
 
@@ -224,15 +222,15 @@ static bool v4l2_streaming(void) {
 
 static void start_overlay(void) {
     if (overlay_active) return;
-    log_msg("Starting overlay\n");
-    
+    log_info("Starting overlay\n");
+
     char bstr[16], wstr[16], sstr[16];
     snprintf(bstr, sizeof(bstr), "%d", brightness);
     snprintf(wstr, sizeof(wstr), "%d", width);
-    
+
     int num = screen_count > 0 ? screen_count : 1;
     overlay_count = 0;
-    
+
     for (int i = 0; i < num && overlay_count < MAX_ITEMS; i++) {
         pid_t pid = fork();
         if (pid == 0) {
@@ -260,7 +258,7 @@ static void start_overlay(void) {
 
 static void stop_overlay(void) {
     if (!overlay_active) return;
-    log_msg("Stopping overlay\n");
+    log_info("Stopping overlay\n");
     for (int i = 0; i < overlay_count; i++) {
         if (overlay_pids[i] > 0) {
             kill(overlay_pids[i], SIGTERM);
@@ -278,17 +276,11 @@ static void cleanup(void) {
     for (int i = 0; i < screen_count; i++) free(screens[i]);
 }
 
-/* Check if a PID is still alive */
-static bool pid_alive(pid_t pid) {
-    return kill(pid, 0) == 0;
-}
-
-/* Verify watched PIDs are still running, remove dead ones */
 static void verify_watched_pids(void) {
     int i = 0;
     while (i < watched_pid_count) {
-        if (!pid_alive(watched_pids[i])) {
-            log_msg("Process died: pid %d\n", watched_pids[i]);
+        if (kill(watched_pids[i], 0) != 0) {
+            log_info("Process exited: pid %d\n", watched_pids[i]);
             watched_pids[i] = watched_pids[--watched_pid_count];
         } else {
             i++;
@@ -296,112 +288,77 @@ static void verify_watched_pids(void) {
     }
 }
 
-/* Process all netlink messages in buffer */
-static void process_netlink_events(char *buf, ssize_t len) {
-    struct nlmsghdr *nlh;
-    
-    for (nlh = (struct nlmsghdr *)buf; NLMSG_OK(nlh, (size_t)len); nlh = NLMSG_NEXT(nlh, len)) {
-        if (nlh->nlmsg_type == NLMSG_DONE || nlh->nlmsg_type == NLMSG_ERROR)
-            continue;
-        
-        struct cn_msg *cn = NLMSG_DATA(nlh);
-        struct proc_event *ev = (struct proc_event *)cn->data;
-        
-        if (ev->what == PROC_EVENT_EXEC) {
-            pid_t pid = ev->event_data.exec.process_pid;
-            if (matches_watch_list(pid)) {
-                log_msg("Process started: pid %d\n", pid);
-                add_watched_pid(pid);
-                if (!overlay_active) start_overlay();
-            }
-        } else if (ev->what == PROC_EVENT_EXIT) {
-            pid_t pid = ev->event_data.exit.process_pid;
-            if (watched_pid_count > 0) {
-                remove_watched_pid(pid);
-                if (watched_pid_count == 0 && overlay_active) {
-                    log_msg("All watched processes exited\n");
-                    stop_overlay();
-                }
-            }
-        }
-    }
-}
+static void process_netlink_event(char *buf) {
+    struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
+    struct cn_msg *cn = NLMSG_DATA(nlh);
+    struct proc_event *ev = (struct proc_event *)cn->data;
 
-static void run_process_mode(void) {
-    log_msg("Process mode: watching");
-    for (int i = 0; i < watch_proc_count; i++) log_msg(" %s", watch_procs[i]);
-    log_msg("\n");
-    
-    char buf[8192];
-    while (running) {
-        struct pollfd pfd = { .fd = nl_sock, .events = POLLIN };
-        /* Timeout every 500ms to verify PIDs are still alive */
-        int ret = poll(&pfd, 1, overlay_active ? 500 : -1);
-        
-        if (ret > 0 && (pfd.revents & POLLIN)) {
-            ssize_t len = recv(nl_sock, buf, sizeof(buf), MSG_DONTWAIT);
-            if (len > 0) {
-                process_netlink_events(buf, len);
-            }
+    if (ev->what == PROC_EVENT_EXEC) {
+        pid_t pid = ev->event_data.exec.process_pid;
+        if (matches_watch_list(pid)) {
+            log_info("Matched process: pid %d\n", pid);
+            add_watched_pid(pid);
+            if (!overlay_active) start_overlay();
         }
-        
-        /* Safety check: verify watched processes are still running */
-        if (overlay_active && watched_pid_count > 0) {
-            verify_watched_pids();
-            if (watched_pid_count == 0) {
-                log_msg("No watched processes remaining\n");
+    } else if (ev->what == PROC_EVENT_EXIT) {
+        pid_t pid = ev->event_data.exit.process_pid;
+        if (watched_pid_count > 0) {
+            remove_watched_pid(pid);
+            if (watched_pid_count == 0 && overlay_active) {
+                log_info("All watched processes exited\n");
                 stop_overlay();
             }
         }
     }
 }
 
+static void run_process_mode(void) {
+    log_info("Process mode: watching %d process(es)\n", watch_proc_count);
+
+    char buf[8192];
+    while (running) {
+        struct pollfd pfd = { .fd = nl_sock, .events = POLLIN };
+        int ret = poll(&pfd, 1, overlay_active ? 500 : -1);
+
+        if (ret > 0 && (pfd.revents & POLLIN)) {
+            ssize_t len = recv(nl_sock, buf, sizeof(buf), MSG_DONTWAIT);
+            if (len > 0) process_netlink_event(buf);
+        }
+
+        if (overlay_active && watched_pid_count > 0) {
+            verify_watched_pids();
+            if (watched_pid_count == 0) stop_overlay();
+        }
+    }
+}
+
 static void run_camera_mode(void) {
-    log_msg("Camera mode: polling %s every %dms\n", video_dev, poll_interval_ms);
+    log_info("Camera mode: polling %s every %dms\n", video_dev, poll_interval_ms);
     while (running) {
         bool active = v4l2_streaming();
-        if (active && !overlay_active) { log_msg("Camera active\n"); start_overlay(); }
-        else if (!active && overlay_active) { log_msg("Camera inactive\n"); stop_overlay(); }
+        if (active && !overlay_active) { log_info("Camera active\n"); start_overlay(); }
+        else if (!active && overlay_active) { log_info("Camera inactive\n"); stop_overlay(); }
         usleep(poll_interval_ms * 1000);
     }
 }
 
 static void run_hybrid_mode(void) {
-    log_msg("Hybrid mode: processes");
-    for (int i = 0; i < watch_proc_count; i++) log_msg(" %s", watch_procs[i]);
-    log_msg(" + camera poll %dms\n", poll_interval_ms);
-    
+    log_info("Hybrid mode: process + camera poll %dms\n", poll_interval_ms);
+
     char buf[4096];
     while (running) {
         struct pollfd pfd = { .fd = nl_sock, .events = POLLIN };
         int ret = poll(&pfd, 1, poll_interval_ms);
-        
+
         if (ret > 0 && (pfd.revents & POLLIN)) {
             ssize_t len = recv(nl_sock, buf, sizeof(buf), MSG_DONTWAIT);
-            if (len > 0) {
-                struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
-                if (NLMSG_OK(nlh, (size_t)len)) {
-                    struct cn_msg *cn = NLMSG_DATA(nlh);
-                    struct proc_event *ev = (struct proc_event *)cn->data;
-                    
-                    if (ev->what == PROC_EVENT_EXEC) {
-                        pid_t pid = ev->event_data.exec.process_pid;
-                        if (matches_watch_list(pid)) {
-                            log_msg("Process started: pid %d\n", pid);
-                            add_watched_pid(pid);
-                            if (!overlay_active) start_overlay();
-                        }
-                    } else if (ev->what == PROC_EVENT_EXIT) {
-                        remove_watched_pid(ev->event_data.exit.process_pid);
-                    }
-                }
-            }
+            if (len > 0) process_netlink_event(buf);
         }
-        
+
         if (watched_pid_count == 0) {
             bool cam = v4l2_streaming();
-            if (cam && !overlay_active) { log_msg("Camera active\n"); start_overlay(); }
-            else if (!cam && overlay_active) { log_msg("Camera inactive\n"); stop_overlay(); }
+            if (cam && !overlay_active) { log_info("Camera active\n"); start_overlay(); }
+            else if (!cam && overlay_active) { log_info("Camera inactive\n"); stop_overlay(); }
         }
     }
 }
@@ -410,9 +367,9 @@ static void usage(const char *prog) {
     printf("Usage: %s [options]\n\n"
            "Modes:\n"
            "  -m, --mode MODE      process|camera|hybrid (default: process)\n"
-           "                       process: only watched processes, no polling\n"
+           "                       process: netlink-based, requires CAP_NET_ADMIN\n"
            "                       camera: poll for any camera activity\n"
-           "                       hybrid: both\n\n"
+           "                       hybrid: both methods combined\n\n"
            "Options:\n"
            "  -d, --device PATH    Video device (default: /dev/video0)\n"
            "  -p, --proc NAME      Process to watch, repeatable (default: howdy)\n"
@@ -431,7 +388,7 @@ int main(int argc, char *argv[]) {
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}
     };
-    
+
     int c;
     while ((c = getopt_long(argc, argv, "m:d:p:i:vh", opts, NULL)) != -1) {
         switch (c) {
@@ -447,33 +404,32 @@ int main(int argc, char *argv[]) {
             case 'h': usage(argv[0]); return 0;
         }
     }
-    
+
     load_config();
     if (watch_proc_count == 0) watch_procs[watch_proc_count++] = strdup("howdy");
-    
+
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
     signal(SIGCHLD, SIG_IGN);
     atexit(cleanup);
-    
+
     if (mode != MODE_CAMERA) {
         if (setup_netlink() < 0) {
             if (mode == MODE_PROCESS) {
-                log_err("Process mode requires netlink (CAP_NET_ADMIN). Exiting.\n");
+                log_err("Process mode requires CAP_NET_ADMIN capability.\n");
+                log_err("Run: sudo setcap cap_net_admin+ep %s\n", argv[0]);
                 return 1;
             }
             log_err("Netlink failed, falling back to camera mode\n");
             mode = MODE_CAMERA;
         }
     }
-    
-    log_msg("Started (%s)\n", mode == MODE_PROCESS ? "process" : mode == MODE_CAMERA ? "camera" : "hybrid");
-    
+
     switch (mode) {
         case MODE_PROCESS: run_process_mode(); break;
         case MODE_CAMERA:  run_camera_mode(); break;
         case MODE_HYBRID:  run_hybrid_mode(); break;
     }
-    
+
     return 0;
 }

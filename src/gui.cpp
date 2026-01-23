@@ -1,6 +1,8 @@
 /*
  * RingLight GUI - Settings panel with system tray
- * License: MIT
+ * 
+ * Copyright (C) 2024-2025 Bryan
+ * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
 #include <QApplication>

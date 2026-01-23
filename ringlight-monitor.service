@@ -1,13 +1,13 @@
 [Unit]
 Description=RingLight Monitor - Automatic screen ring light
+Documentation=https://github.com/yourusername/ringlight
 After=graphical-session.target
-PartOf=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/ringlight-monitor-wrapper
+ExecStart=/usr/bin/ringlight-monitor-wrapper
 Restart=on-failure
-RestartSec=5
+RestartSec=3
 
 [Install]
-WantedBy=graphical-session.target
+WantedBy=default.target

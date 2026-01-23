@@ -60,5 +60,18 @@ target_link_libraries(ringlight-overlay PRIVATE ${WAYLAND_LIBRARIES} rt)
 add_executable(ringlight-gui src/gui.cpp)
 target_link_libraries(ringlight-gui PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets)
 
-# Install
-install(TARGETS ringlight-overlay ringlight-gui RUNTIME DESTINATION bin)
+# Monitor daemon (pure C)
+add_executable(ringlight-monitor src/monitor.c)
+target_link_libraries(ringlight-monitor PRIVATE)
+
+# Install binaries
+install(TARGETS ringlight-overlay ringlight-gui ringlight-monitor RUNTIME DESTINATION bin)
+
+# Install wrapper script
+install(PROGRAMS ringlight-monitor-wrapper DESTINATION bin)
+
+# Install systemd user service
+install(FILES ringlight-monitor.service DESTINATION lib/systemd/user)
+
+# Install desktop file
+install(FILES resources/ringlight.desktop DESTINATION share/applications)

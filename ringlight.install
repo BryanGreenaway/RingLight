@@ -6,15 +6,18 @@ post_install() {
         echo "    Capabilities set successfully"
     else
         echo "    Note: Could not set capabilities (needs root)"
-        echo "    ringlight-monitor will use polling mode"
+        echo "    ringlight-monitor will fall back to polling mode"
         echo "    To enable instant detection:"
         echo "      sudo setcap cap_net_admin+ep /usr/bin/ringlight-monitor"
     fi
     
     echo ""
-    echo "==> RingLight installed successfully!"
-    echo "    Start the GUI:           ringlight-gui"
-    echo "    Enable auto-start:       systemctl --user enable --now ringlight-monitor"
+    echo "==> RingLight installed!"
+    echo ""
+    echo "    Start the GUI:        ringlight-gui"
+    echo ""
+    echo "    Enable auto-start:    systemctl --user enable ringlight-monitor"
+    echo "    Start now:            systemctl --user start ringlight-monitor"
     echo ""
 }
 
@@ -23,12 +26,12 @@ post_upgrade() {
 }
 
 pre_remove() {
-    echo "==> Stopping ringlight services..."
     # Stop user services for all logged-in users
     for user_dir in /run/user/*; do
         if [ -d "$user_dir" ]; then
             uid=$(basename "$user_dir")
             sudo -u "#$uid" systemctl --user stop ringlight-monitor 2>/dev/null || true
+            sudo -u "#$uid" systemctl --user disable ringlight-monitor 2>/dev/null || true
         fi
     done
     

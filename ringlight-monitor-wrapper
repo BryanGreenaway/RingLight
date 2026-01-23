@@ -4,7 +4,7 @@
 
 # If already set, just run
 if [[ -n "$WAYLAND_DISPLAY" && -n "$XDG_RUNTIME_DIR" ]]; then
-    exec /usr/local/bin/ringlight-monitor "$@"
+    exec /usr/bin/ringlight-monitor "$@"
 fi
 
 # Try to get from a running KDE/Plasma/Wayland process
@@ -32,7 +32,7 @@ for proc in kwin_wayland plasmashell kded6 kded5 gnome-shell sway Hyprland; do
 done
 
 if [[ -z "$WAYLAND_DISPLAY" ]]; then
-    echo "[ringlight-monitor-wrapper] ERROR: Could not find WAYLAND_DISPLAY" >&2
+    echo "[ringlight-monitor-wrapper] Could not find WAYLAND_DISPLAY" >&2
     exit 1
 fi
 
@@ -40,4 +40,4 @@ if [[ -z "$XDG_RUNTIME_DIR" ]]; then
     export XDG_RUNTIME_DIR="/run/user/$(id -u)"
 fi
 
-exec /usr/local/bin/ringlight-monitor "$@"
+exec /usr/bin/ringlight-monitor "$@"
