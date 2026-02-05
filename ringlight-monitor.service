@@ -5,7 +5,7 @@ After=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/ringlight-monitor-wrapper
+ExecStart=/usr/local/bin/ringlight-monitor-wrapper
 Restart=on-failure
 RestartSec=3
 

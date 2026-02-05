@@ -182,7 +182,8 @@ int main(int argc, char *argv[]) {
     /* Auto-detect backend */
     if (selected_backend == BACKEND_AUTO) {
 #ifdef HAVE_WAYLAND
-        if (getenv("WAYLAND_DISPLAY"))
+        const char *wl_env = getenv("WAYLAND_DISPLAY");
+        if (wl_env && wl_env[0])
             selected_backend = BACKEND_WAYLAND;
         else
 #endif

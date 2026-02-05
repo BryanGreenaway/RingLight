@@ -19,7 +19,6 @@
 #include <poll.h>
 
 #include <wayland-client.h>
-#include "xdg-shell-client.h"
 #include "wlr-layer-shell-unstable-v1-client.h"
 
 #include "overlay_common.h"

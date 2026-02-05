@@ -153,6 +153,9 @@ static bool matches_watch_list(pid_t pid) {
 
     if (!got_comm && !got_cmdline) return false;
 
+    /* Skip our own processes */
+    if (got_comm && strncmp(comm, "ringlight", 9) == 0) return false;
+
     for (int i = 0; i < watch_proc_count; i++) {
         if (got_comm && strcasecmp(comm, watch_procs[i]) == 0) return true;
         if (got_cmdline && strcasestr(cmdline, watch_procs[i])) return true;
@@ -224,7 +227,7 @@ static void start_overlay(void) {
     if (overlay_active) return;
     log_info("Starting overlay\n");
 
-    char bstr[16], wstr[16], sstr[16];
+    char bstr[16], wstr[16];
     snprintf(bstr, sizeof(bstr), "%d", brightness);
     snprintf(wstr, sizeof(wstr), "%d", width);
 
@@ -234,6 +237,7 @@ static void start_overlay(void) {
     for (int i = 0; i < num && overlay_count < MAX_ITEMS; i++) {
         pid_t pid = fork();
         if (pid == 0) {
+            char sstr[64];
             char *args[16];
             int n = 0;
             args[n++] = (char*)"ringlight-overlay";
@@ -389,6 +393,10 @@ int main(int argc, char *argv[]) {
         {0, 0, 0, 0}
     };
 
+    /* Load config first, then let CLI args override */
+    load_config();
+
+    bool cli_procs = false;
     int c;
     while ((c = getopt_long(argc, argv, "m:d:p:i:vh", opts, NULL)) != -1) {
         switch (c) {
@@ -398,14 +406,20 @@ int main(int argc, char *argv[]) {
                 else if (strcmp(optarg, "hybrid") == 0) mode = MODE_HYBRID;
                 break;
             case 'd': strncpy(video_dev, optarg, sizeof(video_dev)-1); break;
-            case 'p': if (watch_proc_count < MAX_ITEMS) watch_procs[watch_proc_count++] = strdup(optarg); break;
+            case 'p':
+                if (!cli_procs) {
+                    for (int i = 0; i < watch_proc_count; i++) free(watch_procs[i]);
+                    watch_proc_count = 0;
+                    cli_procs = true;
+                }
+                if (watch_proc_count < MAX_ITEMS) watch_procs[watch_proc_count++] = strdup(optarg);
+                break;
             case 'i': poll_interval_ms = atoi(optarg); if (poll_interval_ms < 100) poll_interval_ms = 100; break;
             case 'v': verbose = true; break;
             case 'h': usage(argv[0]); return 0;
         }
     }
 
-    load_config();
     if (watch_proc_count == 0) watch_procs[watch_proc_count++] = strdup("howdy");
 
     signal(SIGINT, sig_handler);

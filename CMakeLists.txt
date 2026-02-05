@@ -41,7 +41,7 @@ if(ENABLE_WAYLAND)
     set(PROTO_BUILD_DIR "${CMAKE_BINARY_DIR}/protocols")
     file(MAKE_DIRECTORY ${PROTO_BUILD_DIR})
 
-    # xdg-shell protocol
+    # xdg-shell protocol (required by wlr-layer-shell)
     set(XDG_SHELL_XML "${WL_PROTOCOL_DIR}/stable/xdg-shell/xdg-shell.xml")
     set(XDG_SHELL_C "${PROTO_BUILD_DIR}/xdg-shell-client.c")
     set(XDG_SHELL_H "${PROTO_BUILD_DIR}/xdg-shell-client.h")
@@ -63,7 +63,7 @@ if(ENABLE_WAYLAND)
         DEPENDS ${LAYER_SHELL_XML}
     )
 
-    list(APPEND OVERLAY_SOURCES src/overlay_wayland.c ${XDG_SHELL_C} ${LAYER_SHELL_C})
+    list(APPEND OVERLAY_SOURCES src/overlay_wayland.c ${LAYER_SHELL_C})
     list(APPEND OVERLAY_INCLUDE_DIRS ${PROTO_BUILD_DIR} ${WAYLAND_INCLUDE_DIRS})
     list(APPEND OVERLAY_LIBRARIES ${WAYLAND_LIBRARIES} rt)
     list(APPEND OVERLAY_DEFINES HAVE_WAYLAND)

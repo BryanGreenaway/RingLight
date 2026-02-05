@@ -1,4 +1,4 @@
-PREFIX ?= /usr
+PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
 SYSTEMD_USER_DIR ?= $(PREFIX)/lib/systemd/user
 
@@ -17,7 +17,7 @@ ringlight-monitor: src/monitor.c
 	$(CC) $(CFLAGS) -o $@ $<
 	strip $@
 
-build/ringlight-gui build/ringlight-overlay: src/gui.cpp src/overlay.c CMakeLists.txt
+build/ringlight-gui build/ringlight-overlay &: src/gui.cpp src/overlay.c src/overlay_common.h src/overlay_wayland.c src/overlay_x11.c CMakeLists.txt
 	@mkdir -p build
 	@cd build && cmake -DCMAKE_INSTALL_PREFIX=$(PREFIX) .. && make -j$$(nproc)
 

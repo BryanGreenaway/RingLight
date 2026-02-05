@@ -66,8 +66,8 @@ public:
         setMinimumWidth(420);
         setupUI();
         setupTray();
-        loadSettings();
         refreshScreens();
+        loadSettings();
     }
     
     ~RingLightGUI() { cleanup(); }
@@ -305,7 +305,7 @@ private:
             auto *item = new QListWidgetItem(name);
             item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
             item->setCheckState(i == 0 ? Qt::Checked : Qt::Unchecked);
-            item->setData(Qt::UserRole, i);
+            item->setData(Qt::UserRole, scr->name());
             m_screenList->addItem(item);
         }
     }
@@ -492,11 +492,6 @@ private:
         
         onAutoEnableToggled(m_autoEnable->isChecked());
         onModeChanged(m_modeCombo->currentIndex());
-        
-        // Auto-start monitor if enabled
-        if (m_autoEnable->isChecked()) {
-            startMonitor();
-        }
     }
     
     // UI
