@@ -30,6 +30,8 @@
 #include <pwd.h>
 #include <poll.h>
 
+#include "procmatch.h"
+
 #define MAX_ITEMS 16
 
 enum monitor_mode { MODE_PROCESS, MODE_CAMERA, MODE_HYBRID };
@@ -121,44 +123,20 @@ static void load_config(void) {
     fclose(f);
 }
 
-static bool get_proc_comm(pid_t pid, char *buf, size_t len) {
-    char path[64];
-    snprintf(path, sizeof(path), "/proc/%d/comm", pid);
-    FILE *f = fopen(path, "r");
-    if (!f) return false;
-    if (!fgets(buf, len, f)) { fclose(f); return false; }
-    fclose(f);
-    char *nl = strchr(buf, '\n');
-    if (nl) *nl = '\0';
-    return true;
-}
-
-static bool get_proc_cmdline(pid_t pid, char *buf, size_t len) {
-    char path[64];
-    snprintf(path, sizeof(path), "/proc/%d/cmdline", pid);
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return false;
-    ssize_t n = read(fd, buf, len - 1);
-    close(fd);
-    if (n <= 0) return false;
-    buf[n] = '\0';
-    for (ssize_t i = 0; i < n - 1; i++) if (buf[i] == '\0') buf[i] = ' ';
-    return true;
-}
-
 static bool matches_watch_list(pid_t pid) {
-    char comm[256] = {0}, cmdline[1024] = {0};
-    bool got_comm = get_proc_comm(pid, comm, sizeof(comm));
-    bool got_cmdline = get_proc_cmdline(pid, cmdline, sizeof(cmdline));
-
-    if (!got_comm && !got_cmdline) return false;
+    struct proc_snapshot snap;
+    if (!procmatch_snapshot(pid, &snap)) return false;
 
     /* Skip our own processes */
-    if (got_comm && strncmp(comm, "ringlight", 9) == 0) return false;
+    if (snap.info.comm && strncmp(snap.info.comm, "ringlight", 9) == 0) return false;
 
     for (int i = 0; i < watch_proc_count; i++) {
-        if (got_comm && strcasecmp(comm, watch_procs[i]) == 0) return true;
-        if (got_cmdline && strcasestr(cmdline, watch_procs[i])) return true;
+        if (proc_matches_name(&snap.info, watch_procs[i])) {
+            log_info("pid %d matched \"%s\" (comm=%s exe=%s)\n", pid, watch_procs[i],
+                     snap.info.comm ? snap.info.comm : "?",
+                     snap.info.exe ? snap.info.exe : "?");
+            return true;
+        }
     }
     return false;
 }

@@ -90,7 +90,7 @@ add_executable(ringlight-gui src/gui.cpp)
 target_link_libraries(ringlight-gui PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets)
 
 # Monitor daemon (pure C)
-add_executable(ringlight-monitor src/monitor.c)
+add_executable(ringlight-monitor src/monitor.c src/procmatch.c)
 target_link_libraries(ringlight-monitor PRIVATE)
 
 # Install binaries

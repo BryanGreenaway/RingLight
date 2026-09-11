@@ -5,7 +5,7 @@ SYSTEMD_USER_DIR ?= $(PREFIX)/lib/systemd/user
 CC ?= gcc
 CFLAGS ?= -O2 -Wall -Wextra
 
-.PHONY: all clean install install-user uninstall gui monitor
+.PHONY: all clean install install-user uninstall gui monitor test
 
 all: monitor gui
 
@@ -13,9 +13,22 @@ monitor: ringlight-monitor
 
 gui: build/ringlight-gui build/ringlight-overlay
 
-ringlight-monitor: src/monitor.c
-	$(CC) $(CFLAGS) -o $@ $<
+ringlight-monitor: src/monitor.c src/procmatch.c src/procmatch.h
+	$(CC) $(CFLAGS) -o $@ src/monitor.c src/procmatch.c
 	strip $@
+
+test: build/test_procmatch
+	./build/test_procmatch
+
+build/test_procmatch: tests/test_procmatch.c src/procmatch.c src/procmatch.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/test_procmatch.c src/procmatch.c
+
+# Ad-hoc helper: check how a live process is classified.
+#   ./build/procmatch_pid $$(pgrep -n python) howdy
+build/procmatch_pid: tests/procmatch_pid.c src/procmatch.c src/procmatch.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/procmatch_pid.c src/procmatch.c
 
 build/ringlight-gui build/ringlight-overlay &: src/gui.cpp src/overlay.c src/overlay_common.h src/overlay_wayland.c src/overlay_x11.c CMakeLists.txt
 	@mkdir -p build
